@@ -1,0 +1,13 @@
+.{
+    .name = .nanoapi,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .turboapi_core = .{
+            .url = "git+https://github.com/justrach/turboapi-core.git?ref=main#f92f3cc48b8d3767fbfe2d92e49e14f52f532f60",
+            .hash = "turboapi_core-0.1.0-DjdHgmaTAAC5tl8N6M66vDdnSSS6CPbk6QwhlCLH--PZ",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0x924e1b5db7492348,
+}
