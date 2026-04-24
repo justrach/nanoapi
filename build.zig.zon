@@ -7,6 +7,10 @@
             .url = "git+https://github.com/justrach/turboapi-core.git?ref=main#f92f3cc48b8d3767fbfe2d92e49e14f52f532f60",
             .hash = "turboapi_core-0.1.0-DjdHgmaTAAC5tl8N6M66vDdnSSS6CPbk6QwhlCLH--PZ",
         },
+        .dhi = .{
+            .url = "git+https://github.com/justrach/dhi.git?ref=main#4f607331c51b2ec974310e8cb5d40cf61a8ab6b1",
+            .hash = "dhi-0.1.0-Fz3bn1CFAwDexo2jviNTcIrQeJZ5TM6fCcHcdPIO2wK1",
+        },
     },
     .paths = .{""},
     .fingerprint = 0x924e1b5db7492348,

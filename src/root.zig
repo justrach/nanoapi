@@ -14,6 +14,7 @@ pub const security = @import("security.zig");
 pub const server = @import("server.zig");
 pub const status = @import("status.zig");
 pub const typed = @import("typed.zig");
+pub const validation = @import("validation.zig");
 
 pub const App = app.App;
 pub const NanoAPI = app.App;
@@ -29,6 +30,10 @@ pub const HTMLResponse = response.HTMLResponse;
 pub const PlainTextResponse = response.PlainTextResponse;
 pub const RedirectResponse = response.RedirectResponse;
 pub const FileResponse = response.FileResponse;
+pub const StreamingResponse = response.StreamingResponse;
+pub const EventSourceResponse = response.EventSourceResponse;
+pub const StreamContext = response.StreamContext;
+pub const SseWriter = response.SseWriter;
 
 pub const Path = params.Path;
 pub const Query = params.Query;
@@ -42,6 +47,11 @@ pub const Parameter = metadata.Parameter;
 pub const RouteOptions = metadata.RouteOptions;
 
 pub const BackgroundTasks = background.BackgroundTasks;
+pub const ValidationErrors = validation.ValidationErrors;
+pub const ValidationResult = validation.ValidationResult;
+pub const BoundedInt = validation.BoundedInt;
+pub const BoundedString = validation.BoundedString;
+pub const Email = validation.Email;
 
 pub const HTTPException = security.HTTPException;
 pub const RequestValidationError = security.RequestValidationError;
@@ -214,6 +224,31 @@ test "typed routes parse path and query structs" {
     try std.testing.expect(!route.options.parameters[1].required);
 }
 
+test "typed routes return DHI-backed validation errors" {
+    const allocator = std.testing.allocator;
+    var api = try NanoAPI.init(allocator, .{});
+    defer api.deinit();
+
+    const QueryParams = struct {
+        email: []const u8,
+    };
+    const Handler = struct {
+        fn get(ctx: typed.Context(typed.Empty, QueryParams)) anyerror!Response {
+            _ = ctx;
+            return response.JSONResponse.static(std.testing.allocator, "{\"ok\":true}", .{});
+        }
+    };
+
+    try api.getTyped(typed.Empty, QueryParams, "/validate", Handler.get, .{});
+
+    var req = Request.init(allocator, "GET", "/validate?email=invalid", &.{}, "");
+    var resp = try api.handle(&req);
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, status.HTTP_422_UNPROCESSABLE_ENTITY), resp.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "ValidationFailed") != null);
+}
+
 test {
     _ = core;
     _ = app;
@@ -228,4 +263,5 @@ test {
     _ = server;
     _ = status;
     _ = typed;
+    _ = validation;
 }

@@ -77,6 +77,8 @@ zig build -Doptimize=ReleaseFast http-server -- 8080
 ```
 
 The package depends on `turboapi_core`, pinned in `build.zig.zon`.
+It also depends on `dhi` for Zig-native validation primitives and model-style
+descriptors.
 
 ## HTTP Server
 
@@ -91,13 +93,40 @@ The initial server is a compact HTTP/1.1 implementation with keep-alive and a
 thread per accepted connection. It is enough for local `wrk` benchmarking while
 the runtime evolves.
 
+## Streaming, Files, and SSE
+
+Responses now keep the fast byte-body path while also supporting streamed files
+and chunked stream writers:
+
+```zig
+fn events(ctx: *nano.StreamContext) !void {
+    var sse = nano.SseWriter.init(ctx);
+    try sse.event("ready", "hello", "1");
+}
+
+fn sse(req: *nano.Request) !nano.Response {
+    return nano.EventSourceResponse.init(req.allocator, events, .{});
+}
+
+fn download(req: *nano.Request) !nano.Response {
+    return nano.FileResponse.init(req.allocator, "assets/report.pdf", null, .{});
+}
+```
+
+WebSockets should be a separate upgrade route that takes over the accepted
+connection instead of returning a normal `Response`. QUIC/HTTP3 should be a
+separate transport backend sharing `NanoAPI.handle`; it is not a small patch to
+the HTTP/1.1 TCP loop.
+
 ## FastAPI Parity Roadmap
 
 - Done: routing decorators as Zig methods, routers with prefixes, typed
   path/query structs, response classes, cookies, status constants, basic
-  security helpers, OpenAPI, dispatch benchmark, native HTTP server loop.
-- Next: dependency injection execution, validation errors, middleware stack,
-  file uploads/forms, streaming responses, WebSocket surface.
+  security helpers, OpenAPI, dispatch benchmark, native HTTP server loop,
+  streamed files, chunked streaming responses, SSE helpers, DHI-backed typed
+  validation.
+- Next: dependency injection execution, middleware stack, file uploads/forms,
+  WebSocket upgrade routes, optional HTTP3/QUIC transport.
 
 ## License
 

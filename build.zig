@@ -9,6 +9,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     const core_mod = core_dep.module("turboapi-core");
+    const dhi_dep = b.dependency("dhi", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const dhi_mod = dhi_dep.module("dhi");
+    const dhi_model_mod = dhi_dep.module("model");
 
     const mod = b.addModule("nanoapi", .{
         .root_source_file = b.path("src/root.zig"),
@@ -16,6 +22,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mod.addImport("turboapi-core", core_mod);
+    mod.addImport("dhi", dhi_mod);
+    mod.addImport("dhi-model", dhi_model_mod);
 
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -26,6 +34,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     tests.root_module.addImport("turboapi-core", core_mod);
+    tests.root_module.addImport("dhi", dhi_mod);
+    tests.root_module.addImport("dhi-model", dhi_model_mod);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");

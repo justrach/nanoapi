@@ -1,4 +1,6 @@
 const std = @import("std");
+const c = std.c;
+const posix = std.posix;
 const status = @import("status.zig");
 
 pub const Header = struct {
@@ -22,6 +24,30 @@ pub const CookieOptions = struct {
     samesite: ?[]const u8 = "lax",
 };
 
+pub const BodyKind = enum {
+    bytes,
+    file,
+    stream,
+};
+
+pub const StreamWriteFn = *const fn (*StreamContext) anyerror!void;
+pub const StreamSinkWriteFn = *const fn (*anyopaque, []const u8) anyerror!void;
+pub const StreamSinkFlushFn = *const fn (*anyopaque) anyerror!void;
+
+pub const StreamContext = struct {
+    sink: *anyopaque,
+    write_fn: StreamSinkWriteFn,
+    flush_fn: ?StreamSinkFlushFn = null,
+
+    pub fn write(self: *StreamContext, bytes: []const u8) !void {
+        try self.write_fn(self.sink, bytes);
+    }
+
+    pub fn flush(self: *StreamContext) !void {
+        if (self.flush_fn) |flush_fn| try flush_fn(self.sink);
+    }
+};
+
 pub const Response = struct {
     allocator: std.mem.Allocator,
     status_code: u16 = status.HTTP_200_OK,
@@ -29,6 +55,11 @@ pub const Response = struct {
     media_type_owned: bool = false,
     body: []const u8 = &.{},
     body_owned: bool = false,
+    body_kind: BodyKind = .bytes,
+    file_path: ?[]const u8 = null,
+    file_path_owned: bool = false,
+    file_size: u64 = 0,
+    stream_writer: ?StreamWriteFn = null,
     headers: std.ArrayList(Header) = .empty,
 
     pub fn init(
@@ -61,6 +92,7 @@ pub const Response = struct {
             .media_type_owned = media_type != null,
             .body = body,
             .body_owned = true,
+            .body_kind = .bytes,
         };
         body_owned = false;
         media_owned = false;
@@ -83,7 +115,67 @@ pub const Response = struct {
             .media_type_owned = false,
             .body = body,
             .body_owned = false,
+            .body_kind = .bytes,
         };
+        errdefer res.deinit();
+        for (options.headers) |h| {
+            try res.addHeader(h.name, h.value);
+        }
+        return res;
+    }
+
+    pub fn fromFilePath(
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        size: u64,
+        options: ResponseOptions,
+    ) !Response {
+        const owned_path = try allocator.dupe(u8, path);
+        errdefer allocator.free(owned_path);
+        const media_type = if (options.media_type) |m| try allocator.dupe(u8, m) else null;
+        var media_owned = true;
+        errdefer if (media_owned) {
+            if (media_type) |m| allocator.free(m);
+        };
+
+        var res = Response{
+            .allocator = allocator,
+            .status_code = options.status_code,
+            .media_type = media_type,
+            .media_type_owned = media_type != null,
+            .body_kind = .file,
+            .file_path = owned_path,
+            .file_path_owned = true,
+            .file_size = size,
+        };
+        media_owned = false;
+        errdefer res.deinit();
+        for (options.headers) |h| {
+            try res.addHeader(h.name, h.value);
+        }
+        return res;
+    }
+
+    pub fn fromStream(
+        allocator: std.mem.Allocator,
+        writer: StreamWriteFn,
+        options: ResponseOptions,
+    ) !Response {
+        const media_type = if (options.media_type) |m| try allocator.dupe(u8, m) else null;
+        var media_owned = true;
+        errdefer if (media_owned) {
+            if (media_type) |m| allocator.free(m);
+        };
+
+        var res = Response{
+            .allocator = allocator,
+            .status_code = options.status_code,
+            .media_type = media_type,
+            .media_type_owned = media_type != null,
+            .body_kind = .stream,
+            .stream_writer = writer,
+        };
+        media_owned = false;
         errdefer res.deinit();
         for (options.headers) |h| {
             try res.addHeader(h.name, h.value);
@@ -99,6 +191,9 @@ pub const Response = struct {
         self.headers.deinit(self.allocator);
         if (self.media_type_owned) {
             if (self.media_type) |m| self.allocator.free(m);
+        }
+        if (self.file_path_owned) {
+            if (self.file_path) |p| self.allocator.free(p);
         }
         if (self.body_owned) self.allocator.free(self.body);
         self.* = undefined;
@@ -175,6 +270,16 @@ pub const Response = struct {
     }
 };
 
+pub const StreamingResponse = struct {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        writer: StreamWriteFn,
+        options: ResponseOptions,
+    ) !Response {
+        return Response.fromStream(allocator, writer, options);
+    }
+};
+
 pub const JSONResponse = struct {
     pub fn init(
         allocator: std.mem.Allocator,
@@ -231,24 +336,17 @@ pub const FileResponse = struct {
         filename: ?[]const u8,
         options: ResponseOptions,
     ) !Response {
-        var file = try std.fs.cwd().openFile(path, .{});
-        defer file.close();
+        const fd = try posix.openat(c.AT.FDCWD, path, .{}, 0);
+        defer _ = c.close(fd);
 
-        const stat_info = try file.stat();
-        const size: usize = @intCast(stat_info.size);
-        const body = try allocator.alloc(u8, size);
-        errdefer allocator.free(body);
-        const read = try file.readAll(body);
-        if (read != size) return error.UnexpectedEndOfFile;
+        var stat_info: c.Stat = undefined;
+        if (c.fstat(fd, &stat_info) != 0) return error.Unexpected;
+        if (stat_info.size < 0) return error.Unexpected;
 
         var opts = options;
         if (opts.media_type == null) opts.media_type = guessMediaType(path);
-        var res = try Response.fromOwnedBody(allocator, body, opts);
+        var res = try Response.fromFilePath(allocator, path, @intCast(stat_info.size), opts);
         errdefer res.deinit();
-
-        const length = try std.fmt.allocPrint(allocator, "{d}", .{read});
-        defer allocator.free(length);
-        try res.setHeader("content-length", length);
 
         if (filename) |name| {
             const disposition = try std.fmt.allocPrint(allocator, "attachment; filename=\"{s}\"", .{name});
@@ -257,6 +355,71 @@ pub const FileResponse = struct {
         }
 
         return res;
+    }
+};
+
+pub const EventSourceResponse = struct {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        writer: StreamWriteFn,
+        options: ResponseOptions,
+    ) !Response {
+        var opts = options;
+        if (opts.media_type == null) opts.media_type = "text/event-stream";
+        var res = try Response.fromStream(allocator, writer, opts);
+        errdefer res.deinit();
+        if (res.header("cache-control") == null) try res.setHeader("cache-control", "no-cache");
+        if (res.header("x-accel-buffering") == null) try res.setHeader("x-accel-buffering", "no");
+        return res;
+    }
+};
+
+pub const SseWriter = struct {
+    ctx: *StreamContext,
+
+    pub fn init(ctx: *StreamContext) SseWriter {
+        return .{ .ctx = ctx };
+    }
+
+    pub fn event(
+        self: *SseWriter,
+        name: ?[]const u8,
+        data: []const u8,
+        id: ?[]const u8,
+    ) !void {
+        if (id) |value| {
+            try self.ctx.write("id: ");
+            try self.ctx.write(value);
+            try self.ctx.write("\n");
+        }
+        if (name) |value| {
+            try self.ctx.write("event: ");
+            try self.ctx.write(value);
+            try self.ctx.write("\n");
+        }
+
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            try self.ctx.write("data: ");
+            try self.ctx.write(line);
+            try self.ctx.write("\n");
+        }
+        try self.ctx.write("\n");
+        try self.ctx.flush();
+    }
+
+    pub fn retry(self: *SseWriter, ms: u64) !void {
+        var buf: [64]u8 = undefined;
+        const line = try std.fmt.bufPrint(&buf, "retry: {d}\n\n", .{ms});
+        try self.ctx.write(line);
+        try self.ctx.flush();
+    }
+
+    pub fn comment(self: *SseWriter, text: []const u8) !void {
+        try self.ctx.write(": ");
+        try self.ctx.write(text);
+        try self.ctx.write("\n\n");
+        try self.ctx.flush();
     }
 };
 
@@ -305,4 +468,59 @@ fn guessMediaType(path: []const u8) []const u8 {
     if (std.mem.endsWith(u8, path, ".png")) return "image/png";
     if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) return "image/jpeg";
     return "application/octet-stream";
+}
+
+test "streaming and SSE response helpers" {
+    const allocator = std.testing.allocator;
+
+    const Handler = struct {
+        fn stream(ctx: *StreamContext) !void {
+            var sse = SseWriter.init(ctx);
+            try sse.event("ready", "hello\nworld", "1");
+        }
+    };
+
+    var res = try EventSourceResponse.init(allocator, Handler.stream, .{});
+    defer res.deinit();
+    try std.testing.expectEqual(BodyKind.stream, res.body_kind);
+    try std.testing.expectEqualStrings("text/event-stream", res.header("content-type").?);
+    try std.testing.expectEqualStrings("no-cache", res.header("cache-control").?);
+
+    const Sink = struct {
+        out: std.ArrayList(u8) = .empty,
+
+        fn write(ptr: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.out.appendSlice(std.testing.allocator, bytes);
+        }
+
+        fn flush(ptr: *anyopaque) !void {
+            _ = ptr;
+        }
+    };
+
+    var sink = Sink{};
+    defer sink.out.deinit(allocator);
+    var ctx = StreamContext{
+        .sink = &sink,
+        .write_fn = Sink.write,
+        .flush_fn = Sink.flush,
+    };
+    try Handler.stream(&ctx);
+    try std.testing.expectEqualStrings(
+        "id: 1\nevent: ready\ndata: hello\ndata: world\n\n",
+        sink.out.items,
+    );
+}
+
+test "file responses keep file payload out of memory" {
+    const allocator = std.testing.allocator;
+    var res = try Response.fromFilePath(allocator, "README.md", 123, .{ .media_type = "text/markdown" });
+    defer res.deinit();
+
+    try std.testing.expectEqual(BodyKind.file, res.body_kind);
+    try std.testing.expectEqual(@as(u64, 123), res.file_size);
+    try std.testing.expectEqualStrings("README.md", res.file_path.?);
+    try std.testing.expectEqualStrings("text/markdown", res.header("content-type").?);
+    try std.testing.expectEqual(@as(usize, 0), res.body.len);
 }

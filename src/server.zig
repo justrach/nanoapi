@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
+const posix = std.posix;
 
 const app_mod = @import("app.zig");
 const request = @import("request.zig");
@@ -179,13 +180,18 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
             sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
             return;
         };
+        const body = readFullBody(server.allocator, fd, parsed) catch {
+            sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+            return;
+        };
+        defer body.deinit(server.allocator);
 
         var req = request.Request.init(
             server.allocator,
             parsed.method,
             parsed.target,
             parsed.headers,
-            parsed.body,
+            body.bytes,
         );
 
         var res = server.app.handle(&req) catch {
@@ -194,7 +200,7 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
         };
         defer res.deinit();
 
-        sendResponse(fd, &res, parsed.keep_alive) catch return;
+        sendResponse(fd, &res, parsed.keep_alive, std.mem.eql(u8, parsed.method, "HEAD")) catch return;
         if (!parsed.keep_alive) return;
     }
 }
@@ -239,13 +245,18 @@ const Connection = struct {
             sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
             return false;
         };
+        const body = readFullBody(self.server.allocator, self.fd, parsed) catch {
+            sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+            return false;
+        };
+        defer body.deinit(self.server.allocator);
 
         var req = request.Request.init(
             self.server.allocator,
             parsed.method,
             parsed.target,
             parsed.headers,
-            parsed.body,
+            body.bytes,
         );
 
         var res = self.server.app.handle(&req) catch {
@@ -254,7 +265,7 @@ const Connection = struct {
         };
         defer res.deinit();
 
-        sendResponse(self.fd, &res, parsed.keep_alive) catch return false;
+        sendResponse(self.fd, &res, parsed.keep_alive, std.mem.eql(u8, parsed.method, "HEAD")) catch return false;
         return parsed.keep_alive;
     }
 };
@@ -264,6 +275,7 @@ const ParsedRequest = struct {
     target: []const u8,
     headers: []const request.HeaderPair,
     body: []const u8,
+    content_length: usize,
     keep_alive: bool,
 };
 
@@ -284,6 +296,7 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
 
     var keep_alive = std.mem.eql(u8, version, "HTTP/1.1");
     var header_count: usize = 0;
+    var content_length: usize = 0;
 
     var lines = std.mem.splitSequence(u8, head[first_line_end + 2 ..], "\r\n");
     while (lines.next()) |line| {
@@ -300,6 +313,8 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
         if (std.ascii.eqlIgnoreCase(name, "connection")) {
             if (std.ascii.eqlIgnoreCase(value, "close")) keep_alive = false;
             if (std.ascii.eqlIgnoreCase(value, "keep-alive")) keep_alive = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            content_length = std.fmt.parseInt(usize, value, 10) catch return error.InvalidHeader;
         }
     }
 
@@ -307,9 +322,43 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
         .method = method,
         .target = target,
         .headers = headers_buf[0..header_count],
-        .body = body,
+        .body = if (body.len > content_length) body[0..content_length] else body,
+        .content_length = content_length,
         .keep_alive = keep_alive,
     };
+}
+
+const BodyBuffer = struct {
+    bytes: []const u8,
+    owned: bool = false,
+
+    fn deinit(self: BodyBuffer, allocator: std.mem.Allocator) void {
+        if (self.owned) allocator.free(self.bytes);
+    }
+};
+
+fn readFullBody(
+    allocator: std.mem.Allocator,
+    fd: c.fd_t,
+    parsed: ParsedRequest,
+) !BodyBuffer {
+    if (parsed.content_length == 0) return .{ .bytes = "" };
+    if (parsed.body.len >= parsed.content_length) {
+        return .{ .bytes = parsed.body[0..parsed.content_length] };
+    }
+
+    const body = try allocator.alloc(u8, parsed.content_length);
+    errdefer allocator.free(body);
+    @memcpy(body[0..parsed.body.len], parsed.body);
+
+    var offset = parsed.body.len;
+    while (offset < body.len) {
+        const n = try recvOnce(fd, body[offset..]);
+        if (n == 0) return error.ConnectionClosed;
+        offset += n;
+    }
+
+    return .{ .bytes = body, .owned = true };
 }
 
 fn createListenSocket(options: Options) !c.fd_t {
@@ -403,7 +452,7 @@ fn recvOnce(fd: c.fd_t, buf: []u8) !usize {
     }
 }
 
-fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool) !void {
+fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool, head_only: bool) !void {
     var sender = BufferedSender.init(fd);
 
     var scratch: [256]u8 = undefined;
@@ -413,7 +462,17 @@ fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool) !vo
         .{ res.status_code, status.text(res.status_code) },
     );
 
-    try sender.print(&scratch, "Content-Length: {d}\r\n", .{res.body.len});
+    const is_stream = res.body_kind == .stream;
+    if (is_stream) {
+        try sender.append("Transfer-Encoding: chunked\r\n");
+    } else {
+        const content_length: u64 = switch (res.body_kind) {
+            .bytes => res.body.len,
+            .file => res.file_size,
+            .stream => unreachable,
+        };
+        try sender.print(&scratch, "Content-Length: {d}\r\n", .{content_length});
+    }
 
     try sender.append(if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n");
 
@@ -421,6 +480,7 @@ fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool) !vo
     for (res.headers.items) |header| {
         if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "transfer-encoding")) continue;
         if (std.ascii.eqlIgnoreCase(header.name, "content-type")) has_content_type = true;
         try sender.append(header.name);
         try sender.append(": ");
@@ -437,8 +497,63 @@ fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool) !vo
     }
 
     try sender.append("\r\n");
-    try sender.append(res.body);
-    try sender.flush();
+    switch (res.body_kind) {
+        .bytes => {
+            if (!head_only) try sender.append(res.body);
+            try sender.flush();
+        },
+        .file => {
+            try sender.flush();
+            if (!head_only) try sendFileBody(fd, res.file_path orelse return error.Unexpected, res.file_size);
+        },
+        .stream => {
+            try sender.flush();
+            if (head_only) return;
+            var chunked = ChunkedSink{ .fd = fd };
+            var ctx = response.StreamContext{
+                .sink = &chunked,
+                .write_fn = chunkedWrite,
+                .flush_fn = chunkedFlush,
+            };
+            const writer = res.stream_writer orelse return error.Unexpected;
+            try writer(&ctx);
+            try ctx.flush();
+            try sendAll(fd, "0\r\n\r\n");
+        },
+    }
+}
+
+fn sendFileBody(fd: c.fd_t, path: []const u8, file_size: u64) !void {
+    const file_fd = try posix.openat(c.AT.FDCWD, path, .{}, 0);
+    defer _ = close(file_fd);
+
+    var buf: [16 * 1024]u8 = undefined;
+    var remaining = file_size;
+    while (remaining > 0) {
+        const max_read = @min(buf.len, remaining);
+        const n = try posix.read(file_fd, buf[0..@intCast(max_read)]);
+        if (n == 0) return error.UnexpectedEndOfFile;
+        try sendAll(fd, buf[0..n]);
+        remaining -= n;
+    }
+}
+
+const ChunkedSink = struct {
+    fd: c.fd_t,
+};
+
+fn chunkedWrite(sink: *anyopaque, bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    const chunked: *ChunkedSink = @ptrCast(@alignCast(sink));
+    var header: [32]u8 = undefined;
+    const header_bytes = try std.fmt.bufPrint(&header, "{x}\r\n", .{bytes.len});
+    try sendAll(chunked.fd, header_bytes);
+    try sendAll(chunked.fd, bytes);
+    try sendAll(chunked.fd, "\r\n");
+}
+
+fn chunkedFlush(sink: *anyopaque) !void {
+    _ = sink;
 }
 
 fn sendError(fd: c.fd_t, code: u16, message: []const u8) !void {
@@ -528,4 +643,16 @@ test "parse HTTP request head" {
     try std.testing.expectEqual(@as(usize, 2), parsed.headers.len);
     try std.testing.expectEqualStrings("Host", parsed.headers[0].name);
     try std.testing.expectEqualStrings("localhost", parsed.headers[0].value);
+}
+
+test "parse HTTP request content length" {
+    var headers: [8]request.HeaderPair = undefined;
+    const parsed = try parseRequestHead(
+        "POST /upload HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhelloextra",
+        &headers,
+    );
+
+    try std.testing.expectEqualStrings("POST", parsed.method);
+    try std.testing.expectEqual(@as(usize, 5), parsed.content_length);
+    try std.testing.expectEqualStrings("hello", parsed.body);
 }

@@ -1,9 +1,11 @@
 const std = @import("std");
+const dhi = @import("dhi");
 
 const meta = @import("metadata.zig");
 const request = @import("request.zig");
 const response = @import("response.zig");
 const routing = @import("routing.zig");
+const status = @import("status.zig");
 
 pub const Empty = struct {};
 
@@ -12,6 +14,8 @@ pub const ParseError = error{
     MissingRequiredQueryParam,
     InvalidBool,
     UnsupportedParamType,
+    ValidationFailed,
+    OutOfMemory,
 };
 
 pub fn Context(comptime PathParams: type, comptime QueryParams: type) type {
@@ -36,10 +40,16 @@ pub fn adapt(
 ) routing.Handler {
     return struct {
         fn call(req: *request.Request) anyerror!response.Response {
+            const path = parsePath(PathParams, req) catch |err| {
+                return parseErrorResponse(req.allocator, err);
+            };
+            const query = parseQuery(QueryParams, req) catch |err| {
+                return parseErrorResponse(req.allocator, err);
+            };
             return handler(.{
                 .raw = req,
-                .path = try parsePath(PathParams, req),
-                .query = try parseQuery(QueryParams, req),
+                .path = path,
+                .query = query,
             });
         }
     }.call;
@@ -133,7 +143,25 @@ fn parseStruct(comptime T: type, req: *const request.Request, comptime location:
         }
     }
 
+    try validateParsed(T, result, req.allocator);
     return result;
+}
+
+fn validateParsed(comptime T: type, value: T, allocator: std.mem.Allocator) ParseError!void {
+    var errors = dhi.ValidationErrors.init(allocator);
+    defer errors.deinit();
+
+    dhi.validateStruct(T, value, &errors) catch return error.OutOfMemory;
+    if (errors.hasErrors()) return error.ValidationFailed;
+}
+
+fn parseErrorResponse(allocator: std.mem.Allocator, err: anyerror) !response.Response {
+    return response.jsonError(
+        allocator,
+        status.HTTP_422_UNPROCESSABLE_ENTITY,
+        @errorName(err),
+        &.{},
+    );
 }
 
 fn parseFieldValue(
