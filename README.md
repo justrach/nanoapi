@@ -1,58 +1,54 @@
 # NanoAPI
 
-NanoAPI is a pure Zig HTTP API library with FastAPI-style behavior as a parity
-target. It reuses
-`turboapi-core` for the hot router and HTTP helpers, then layers a Zig API over
-it with familiar names like `NanoAPI`, `APIRouter`, `Request`, `Response`,
-`JSONResponse`, `HTTPException`, `Query`, `Path`, and `status`.
+NanoAPI is a pure Zig HTTP API framework with FastAPI-inspired ergonomics:
+typed route parameters, response helpers, OpenAPI metadata, streaming responses,
+and a small native HTTP/1.1 server.
 
-This is the first implementation slice: route registration, route inclusion,
-typed path/query parsing, response helpers, security scheme metadata, background
-tasks, and OpenAPI 3.1 JSON generation.
+The hot routing path is backed by `turboapi-core`, while validation primitives
+come from `dhi`. The current dependency pin uses the `dhi` performance branch
+from `justrach/dhi#54`; switch it back to `dhi` main once that PR lands.
 
-## Example
+## Quick Start
 
 ```zig
 const std = @import("std");
 const nano = @import("nanoapi");
 
-fn getUser(req: *nano.Request) !nano.Response {
-    const user_id = req.pathInt("user_id") orelse 0;
-    const body = try std.fmt.allocPrint(
-        req.allocator,
-        "{{\"user_id\":{d}}}",
-        .{user_id},
-    );
-    return nano.Response.fromOwnedBody(req.allocator, body, .{
-        .media_type = "application/json",
-    });
+fn root(req: *nano.Request) !nano.Response {
+    return nano.JSONResponse.static(req.allocator, "{\"ok\":true}", .{});
 }
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    const allocator = std.heap.smp_allocator;
     var app = try nano.NanoAPI.init(allocator, .{
-        .title = "Example",
+        .title = "Example API",
         .version = "1.0.0",
     });
     defer app.deinit();
 
-    const parameters = [_]nano.Parameter{
-        nano.Path("user_id", .integer, .{}),
-        nano.Query("verbose", .boolean, .{ .required = false }),
-    };
+    try app.get("/", root, .{ .tags = &.{"health"} });
 
-    try app.get("/users/{user_id}", getUser, .{
-        .tags = &.{"users"},
-        .parameters = &parameters,
+    try app.listenAndServe(allocator, .{
+        .host = .{ 127, 0, 0, 1 },
+        .port = 8080,
     });
 }
 ```
 
-## Type-Safe Routes
+## Typed Routes
+
+Route handlers can parse path and query values into Zig structs. Defaults and
+optional fields work naturally, and DHI-backed validation runs only when a struct
+uses validation naming conventions such as `email`, `*_email`, or `*_ne`.
 
 ```zig
-const PathParams = struct { user_id: i64 };
-const QueryParams = struct { verbose: bool = false };
+const PathParams = struct {
+    user_id: i64,
+};
+
+const QueryParams = struct {
+    verbose: bool = false,
+};
 
 fn getUser(ctx: nano.typed.Context(PathParams, QueryParams)) !nano.Response {
     const body = try std.fmt.allocPrint(
@@ -68,35 +64,10 @@ fn getUser(ctx: nano.typed.Context(PathParams, QueryParams)) !nano.Response {
 try app.getTyped(PathParams, QueryParams, "/users/{user_id}", getUser, .{});
 ```
 
-## Build
+## Responses
 
-```bash
-zig build test
-zig build -Doptimize=ReleaseFast bench -- 10000000
-zig build -Doptimize=ReleaseFast http-server -- 8080
-```
-
-The package depends on `turboapi_core`, pinned in `build.zig.zon`.
-It also depends on `dhi` for Zig-native validation primitives and model-style
-descriptors.
-
-## HTTP Server
-
-```zig
-try app.listenAndServe(std.heap.smp_allocator, .{
-    .host = .{ 127, 0, 0, 1 },
-    .port = 8080,
-});
-```
-
-The initial server is a compact HTTP/1.1 implementation with keep-alive and a
-thread per accepted connection. It is enough for local `wrk` benchmarking while
-the runtime evolves.
-
-## Streaming, Files, and SSE
-
-Responses now keep the fast byte-body path while also supporting streamed files
-and chunked stream writers:
+NanoAPI includes response helpers for JSON, text, HTML, redirects, file bodies,
+chunked streams, and server-sent events.
 
 ```zig
 fn events(ctx: *nano.StreamContext) !void {
@@ -113,20 +84,70 @@ fn download(req: *nano.Request) !nano.Response {
 }
 ```
 
-WebSockets should be a separate upgrade route that takes over the accepted
-connection instead of returning a normal `Response`. QUIC/HTTP3 should be a
-separate transport backend sharing `NanoAPI.handle`; it is not a small patch to
-the HTTP/1.1 TCP loop.
+## Server Runtime
 
-## FastAPI Parity Roadmap
+The built-in server is a compact HTTP/1.1 implementation with keep-alive. The
+default runtime is `.auto`: on macOS and BSD targets it uses the kqueue event
+loop; elsewhere it falls back to thread-per-connection until another event
+backend is added.
 
-- Done: routing decorators as Zig methods, routers with prefixes, typed
-  path/query structs, response classes, cookies, status constants, basic
-  security helpers, OpenAPI, dispatch benchmark, native HTTP server loop,
-  streamed files, chunked streaming responses, SSE helpers, DHI-backed typed
-  validation.
-- Next: dependency injection execution, middleware stack, file uploads/forms,
-  WebSocket upgrade routes, optional HTTP3/QUIC transport.
+The hot response path avoids unnecessary allocations and omits redundant
+`Connection: keep-alive` headers for HTTP/1.1 responses.
+
+```zig
+try app.listenAndServe(std.heap.smp_allocator, .{
+    .host = .{ 127, 0, 0, 1 },
+    .port = 8080,
+    .runtime = .auto,
+});
+```
+
+## Build And Bench
+
+```bash
+zig build test
+zig build -Doptimize=ReleaseFast bench -- 10000000
+zig build -Doptimize=ReleaseFast http-server -- 8080
+```
+
+Example local `wrk` profile:
+
+```bash
+wrk -t4 -c64 -d10s --latency http://127.0.0.1:8080/
+wrk -t4 -c64 -d10s --latency 'http://127.0.0.1:8080/users/42?verbose=true'
+```
+
+Recent local comparison against `karlseguin/http.zig` using equivalent handlers:
+
+| Route | NanoAPI | http.zig |
+| --- | ---: | ---: |
+| `/` | ~168k req/s | ~166k req/s |
+| `/users/42?verbose=true` | ~167k req/s | ~166k req/s |
+
+Treat these numbers as directional; they vary by machine, thermal state, Zig
+build, and background load.
+
+## Feature Shape
+
+Done:
+
+- `NanoAPI` and `APIRouter`
+- typed path/query structs
+- JSON, text, HTML, redirect, file, stream, and SSE responses
+- cookie helpers
+- status constants
+- security metadata helpers
+- OpenAPI 3.1 JSON generation
+- DHI-backed typed validation
+- native HTTP/1.1 server and dispatch benchmarks
+
+Next:
+
+- middleware stack
+- dependency injection execution
+- file uploads and form parsing
+- WebSocket upgrade routes
+- optional HTTP/3 and QUIC transport sharing the same app/router layer
 
 ## License
 
