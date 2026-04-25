@@ -122,24 +122,17 @@ fn parseStruct(comptime T: type, req: *const request.Request, comptime location:
     var result: T = undefined;
 
     inline for (@typeInfo(T).@"struct".fields) |field| {
-        const raw = switch (location) {
-            .path => req.pathParam(field.name),
-            .query => req.queryParam(field.name),
-            else => unreachable,
-        };
-
-        if (raw) |value| {
-            @field(result, field.name) = try parseFieldValue(field.type, req, field.name, value, location);
-        } else if (field.defaultValue()) |default| {
-            @field(result, field.name) = default;
-        } else if (comptime isOptional(field.type)) {
-            @field(result, field.name) = null;
-        } else {
-            return switch (location) {
-                .path => error.MissingRequiredPathParam,
-                .query => error.MissingRequiredQueryParam,
-                else => unreachable,
-            };
+        switch (try parseField(field.type, req, field.name, location)) {
+            .value => |value| @field(result, field.name) = value,
+            .missing => {
+                if (field.defaultValue()) |default| {
+                    @field(result, field.name) = default;
+                } else if (comptime isOptional(field.type)) {
+                    @field(result, field.name) = null;
+                } else {
+                    return missingRequiredError(location);
+                }
+            },
         }
     }
 
@@ -166,50 +159,111 @@ fn parseErrorResponse(allocator: std.mem.Allocator, err: anyerror) !response.Res
     );
 }
 
-fn parseFieldValue(
+fn ParsedField(comptime T: type) type {
+    return union(enum) {
+        missing,
+        value: T,
+    };
+}
+
+fn parseField(
     comptime T: type,
     req: *const request.Request,
     comptime name: []const u8,
-    raw: []const u8,
     comptime location: meta.Location,
-) ParseError!T {
-    if (location == .path and @typeInfo(T) == .int) {
-        const value = req.pathInt(name) orelse return error.UnsupportedParamType;
-        return std.math.cast(T, value) orelse error.UnsupportedParamType;
+) ParseError!ParsedField(T) {
+    switch (location) {
+        .path => {
+            if (comptime valueKind(T) == .int) {
+                return parsePathIntField(T, req, name);
+            }
+            const raw = req.pathParam(name) orelse return .missing;
+            return .{ .value = try parseValue(T, raw) };
+        },
+        .query => {
+            const raw = req.queryParam(name) orelse return .missing;
+            return .{ .value = try parseValue(T, raw) };
+        },
+        else => unreachable,
     }
-    return parseValue(T, raw);
+}
+
+fn parsePathIntField(comptime T: type, req: *const request.Request, comptime name: []const u8) ParseError!ParsedField(T) {
+    const params = req.path_params orelse return .missing;
+    for (params.entries()) |param| {
+        if (std.mem.eql(u8, param.key, name)) {
+            if (!param.has_int_value) return error.UnsupportedParamType;
+            const value = std.math.cast(T, param.int_value) orelse return error.UnsupportedParamType;
+            return .{ .value = value };
+        }
+    }
+    return .missing;
+}
+
+fn missingRequiredError(comptime location: meta.Location) ParseError {
+    return switch (location) {
+        .path => error.MissingRequiredPathParam,
+        .query => error.MissingRequiredQueryParam,
+        else => unreachable,
+    };
+}
+
+const ValueKind = enum {
+    bool,
+    int,
+    float,
+    optional,
+    string_slice,
+    unsupported,
+};
+
+fn valueKind(comptime T: type) ValueKind {
+    return switch (@typeInfo(T)) {
+        .bool => .bool,
+        .int => .int,
+        .float => .float,
+        .optional => .optional,
+        .pointer => |info| if (info.size == .slice and info.child == u8) .string_slice else .unsupported,
+        else => .unsupported,
+    };
+}
+
+fn optionalChild(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .optional => |info| info.child,
+        else => @compileError("expected optional type"),
+    };
 }
 
 fn parseValue(comptime T: type, raw: []const u8) ParseError!T {
-    return switch (@typeInfo(T)) {
+    return switch (comptime valueKind(T)) {
         .bool => parseBool(raw),
         .int => std.fmt.parseInt(T, raw, 10) catch error.UnsupportedParamType,
         .float => std.fmt.parseFloat(T, raw) catch error.UnsupportedParamType,
-        .optional => |info| if (raw.len == 0) null else try parseValue(info.child, raw),
-        .pointer => |info| blk: {
-            if (info.size == .slice and info.child == u8) break :blk raw;
-            return error.UnsupportedParamType;
-        },
-        else => error.UnsupportedParamType,
+        .optional => if (raw.len == 0) null else try parseValue(optionalChild(T), raw),
+        .string_slice => raw,
+        .unsupported => error.UnsupportedParamType,
     };
 }
 
 fn parseBool(raw: []const u8) ParseError!bool {
-    if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1")) return true;
-    if (std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "0")) return false;
-    if (std.ascii.eqlIgnoreCase(raw, "true") or
-        std.mem.eql(u8, raw, "1") or
-        std.ascii.eqlIgnoreCase(raw, "on") or
-        std.ascii.eqlIgnoreCase(raw, "yes"))
-    {
-        return true;
-    }
-    if (std.ascii.eqlIgnoreCase(raw, "false") or
-        std.mem.eql(u8, raw, "0") or
-        std.ascii.eqlIgnoreCase(raw, "off") or
-        std.ascii.eqlIgnoreCase(raw, "no"))
-    {
-        return false;
+    switch (raw.len) {
+        1 => switch (raw[0]) {
+            '1' => return true,
+            '0' => return false,
+            else => {},
+        },
+        2 => {
+            if (std.ascii.eqlIgnoreCase(raw, "on")) return true;
+            if (std.ascii.eqlIgnoreCase(raw, "no")) return false;
+        },
+        3 => {
+            if (std.ascii.eqlIgnoreCase(raw, "yes")) return true;
+            if (std.ascii.eqlIgnoreCase(raw, "off")) return false;
+        },
+        4 => if (std.ascii.eqlIgnoreCase(raw, "true")) return true,
+        5 => if (std.ascii.eqlIgnoreCase(raw, "false")) return false,
+        else => {},
     }
     return error.InvalidBool;
 }
@@ -228,13 +282,13 @@ fn makeParameter(
 }
 
 fn schemaType(comptime T: type) meta.SchemaType {
-    return switch (@typeInfo(T)) {
+    return switch (comptime valueKind(T)) {
         .bool => .boolean,
         .int => .integer,
         .float => .number,
-        .optional => |info| schemaType(info.child),
-        .pointer => |info| if (info.size == .slice and info.child == u8) .string else .any,
-        else => .any,
+        .optional => schemaType(optionalChild(T)),
+        .string_slice => .string,
+        .unsupported => .any,
     };
 }
 
@@ -254,4 +308,43 @@ fn assertStruct(comptime T: type) void {
     if (@typeInfo(T) != .@"struct") {
         @compileError("typed path/query parameter declarations must be structs, got " ++ @typeName(T));
     }
+}
+
+test "typed bool parser accepts supported forms" {
+    const cases = [_]struct {
+        raw: []const u8,
+        value: bool,
+    }{
+        .{ .raw = "true", .value = true },
+        .{ .raw = "TRUE", .value = true },
+        .{ .raw = "1", .value = true },
+        .{ .raw = "on", .value = true },
+        .{ .raw = "YES", .value = true },
+        .{ .raw = "false", .value = false },
+        .{ .raw = "FALSE", .value = false },
+        .{ .raw = "0", .value = false },
+        .{ .raw = "off", .value = false },
+        .{ .raw = "NO", .value = false },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.value, try parseValue(bool, case.raw));
+    }
+    try std.testing.expectError(error.InvalidBool, parseValue(bool, "truthy"));
+}
+
+test "typed path integer parser uses route param cache" {
+    const core = @import("turboapi-core");
+
+    var req = request.Request.init(std.testing.allocator, "GET", "/items/42", &.{}, "");
+    var params = core.RouteParams{};
+    params.put("id", "42");
+    req.setPathParams(&params);
+
+    const PathParams = struct {
+        id: i8,
+    };
+
+    const parsed = try parsePath(PathParams, &req);
+    try std.testing.expectEqual(@as(i8, 42), parsed.id);
 }

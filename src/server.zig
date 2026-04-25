@@ -582,6 +582,23 @@ fn canUseFastJsonBytes(res: *const response.Response, keep_alive: bool, send_kee
 }
 
 fn sendFastJsonBytes(fd: c.fd_t, body: []const u8) !void {
+    if (comptime @hasDecl(c.SO, "NOSIGPIPE")) {
+        return sendFastJsonBytesVectored(fd, body);
+    }
+    return sendFastJsonBytesBuffered(fd, body);
+}
+
+fn sendFastJsonBytesVectored(fd: c.fd_t, body: []const u8) !void {
+    var len_buf: [20]u8 = undefined;
+    const len_bytes = len_buf[0..appendDecimal(&len_buf, body.len)];
+
+    const prefix = "HTTP/1.1 200 OK\r\nContent-Length: ";
+    const middle = "\r\nContent-Type: application/json\r\n\r\n";
+    const parts = [_][]const u8{ prefix, len_bytes, middle, body };
+    try sendAllParts(fd, &parts);
+}
+
+fn sendFastJsonBytesBuffered(fd: c.fd_t, body: []const u8) !void {
     var buf: [1024]u8 = undefined;
     var len: usize = 0;
 
@@ -607,6 +624,55 @@ fn sendFastJsonBytes(fd: c.fd_t, body: []const u8) !void {
     len += body.len;
 
     try sendAll(fd, buf[0..len]);
+}
+
+fn sendAllParts(fd: c.fd_t, parts: []const []const u8) !void {
+    var iovecs: [8]posix.iovec_const = undefined;
+    var iov_count: usize = 0;
+    for (parts) |part| {
+        if (part.len == 0) continue;
+        iovecs[iov_count] = .{ .base = part.ptr, .len = part.len };
+        iov_count += 1;
+    }
+    if (iov_count == 0) return;
+
+    var index: usize = 0;
+    var offset: usize = 0;
+    while (index < iov_count) {
+        var active: [8]posix.iovec_const = undefined;
+        active[0] = .{
+            .base = iovecs[index].base + offset,
+            .len = iovecs[index].len - offset,
+        };
+        var active_count: usize = 1;
+        var src = index + 1;
+        while (src < iov_count) : (src += 1) {
+            active[active_count] = iovecs[src];
+            active_count += 1;
+        }
+
+        const n = c.writev(fd, &active, @intCast(active_count));
+        switch (c.errno(n)) {
+            .SUCCESS => {
+                if (n == 0) return error.ConnectionClosed;
+                var advanced: usize = @intCast(n);
+                while (advanced > 0) {
+                    const remaining = iovecs[index].len - offset;
+                    if (advanced < remaining) {
+                        offset += advanced;
+                        break;
+                    }
+                    advanced -= remaining;
+                    index += 1;
+                    offset = 0;
+                    if (index == iov_count) break;
+                }
+            },
+            .INTR => continue,
+            .AGAIN => continue,
+            else => |err| return errnoError(err),
+        }
+    }
 }
 
 fn appendDecimal(out: []u8, value: usize) usize {

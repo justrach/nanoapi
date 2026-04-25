@@ -154,7 +154,9 @@ parsers, and a reproducible benchmark suite with regression thresholds.
 ```bash
 zig build test
 zig build -Doptimize=ReleaseFast bench -- 10000000
+zig build -Doptimize=ReleaseFast bench -- 1000000 --warmup 100000 --repeat 5 --format=json
 zig build -Doptimize=ReleaseFast http-server -- 8080
+zig build -Doptimize=ReleaseFast http-server -- 8080 event_loop
 ```
 
 Example local `wrk` profile:
@@ -162,6 +164,7 @@ Example local `wrk` profile:
 ```bash
 wrk -t4 -c64 -d10s --latency http://127.0.0.1:8080/
 wrk -t4 -c64 -d10s --latency 'http://127.0.0.1:8080/users/42?verbose=true'
+./scripts/bench-http.sh
 ```
 
 ## Feature Shape
