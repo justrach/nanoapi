@@ -14,7 +14,7 @@ pub const Request = struct {
     path_params: ?*const core.RouteParams = null,
     header_cache: HeaderCache = .{},
 
-    const CommonHeader = enum {
+    pub const CommonHeader = enum {
         accept,
         authorization,
         content_type,
@@ -23,13 +23,13 @@ pub const Request = struct {
         user_agent,
     };
 
-    const CachedHeader = union(enum) {
+    pub const CachedHeader = union(enum) {
         hit: []const u8,
         miss,
         invalid,
     };
 
-    const HeaderCache = struct {
+    pub const HeaderCache = struct {
         source_ptr: ?[*]const HeaderPair = null,
         source_len: usize = 0,
         accept: ?usize = null,
@@ -39,25 +39,35 @@ pub const Request = struct {
         host: ?usize = null,
         user_agent: ?usize = null,
 
-        fn init(headers: []const HeaderPair) HeaderCache {
-            var cache: HeaderCache = .{
-                .source_ptr = if (headers.len == 0) null else headers.ptr,
-                .source_len = headers.len,
-            };
+        pub fn init(headers: []const HeaderPair) HeaderCache {
+            var cache = initForBuffer(headers);
             for (headers, 0..) |h, idx| {
-                if (commonHeaderId(h.name)) |id| cache.setFirst(id, idx);
+                cache.observe(h.name, idx);
             }
+            cache.finish(headers);
             return cache;
         }
 
-        fn lookup(self: *const HeaderCache, headers: []const HeaderPair, id: CommonHeader) CachedHeader {
+        pub fn initForBuffer(headers: []const HeaderPair) HeaderCache {
+            return .{
+                .source_ptr = if (headers.len == 0) null else headers.ptr,
+            };
+        }
+
+        pub fn finish(self: *HeaderCache, headers: []const HeaderPair) void {
+            self.source_ptr = if (headers.len == 0) null else headers.ptr;
+            self.source_len = headers.len;
+        }
+
+        pub fn observe(self: *HeaderCache, name: []const u8, idx: usize) void {
+            if (commonHeaderId(name)) |id| self.setFirst(id, idx);
+        }
+
+        pub fn lookup(self: *const HeaderCache, headers: []const HeaderPair, id: CommonHeader) CachedHeader {
             if (!self.matches(headers)) return .invalid;
             const idx = self.index(id) orelse return .miss;
             if (idx >= headers.len) return .invalid;
-
-            const h = headers[idx];
-            if (!commonHeaderMatches(h.name, id)) return .invalid;
-            return .{ .hit = h.value };
+            return .{ .hit = headers[idx].value };
         }
 
         fn matches(self: *const HeaderCache, headers: []const HeaderPair) bool {
@@ -133,6 +143,19 @@ pub const Request = struct {
         headers: []const HeaderPair,
         body: []const u8,
     ) Request {
+        return initPartsCached(allocator, method, target, path, query_string, headers, body, HeaderCache.init(headers));
+    }
+
+    pub fn initPartsCached(
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        target: []const u8,
+        path: []const u8,
+        query_string: []const u8,
+        headers: []const HeaderPair,
+        body: []const u8,
+        header_cache: HeaderCache,
+    ) Request {
         return .{
             .allocator = allocator,
             .method = method,
@@ -141,7 +164,7 @@ pub const Request = struct {
             .query_string = query_string,
             .headers = headers,
             .body = body,
-            .header_cache = HeaderCache.init(headers),
+            .header_cache = header_cache,
         };
     }
 
@@ -245,10 +268,6 @@ fn commonHeaderName(id: Request.CommonHeader) []const u8 {
         .host => "host",
         .user_agent => "user-agent",
     };
-}
-
-fn commonHeaderMatches(name: []const u8, id: Request.CommonHeader) bool {
-    return std.ascii.eqlIgnoreCase(name, commonHeaderName(id));
 }
 
 test "Request caches common headers from initParts" {

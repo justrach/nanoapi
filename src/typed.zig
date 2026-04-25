@@ -77,7 +77,10 @@ pub fn parsePath(comptime T: type, req: *const request.Request) ParseError!T {
 }
 
 pub fn parseQuery(comptime T: type, req: *const request.Request) ParseError!T {
-    return parseStruct(T, req, .query);
+    assertStruct(T);
+    const fields = @typeInfo(T).@"struct".fields;
+    if (comptime fields.len <= 1) return parseStruct(T, req, .query);
+    return parseQueryStruct(T, req);
 }
 
 pub fn allocParameters(
@@ -133,6 +136,58 @@ fn parseStruct(comptime T: type, req: *const request.Request, comptime location:
                     return missingRequiredError(location);
                 }
             },
+        }
+    }
+
+    if (comptime needsDhiValidation(T)) {
+        try validateParsed(T, result, req.allocator);
+    }
+    return result;
+}
+
+fn parseQueryStruct(comptime T: type, req: *const request.Request) ParseError!T {
+    assertStruct(T);
+
+    const fields = @typeInfo(T).@"struct".fields;
+    if (comptime fields.len == 0) return .{};
+
+    var result: T = undefined;
+    var seen = [_]bool{false} ** fields.len;
+
+    inline for (fields, 0..) |field, i| {
+        if (field.defaultValue()) |default| {
+            @field(result, field.name) = default;
+        } else if (comptime isOptional(field.type)) {
+            @field(result, field.name) = null;
+        } else {
+            seen[i] = false;
+        }
+    }
+
+    var pos: usize = 0;
+    while (pos < req.query_string.len) {
+        const pair_start = pos;
+        const pair_end = std.mem.indexOfScalarPos(u8, req.query_string, pair_start, '&') orelse req.query_string.len;
+        pos = if (pair_end < req.query_string.len) pair_end + 1 else req.query_string.len;
+
+        const pair = req.query_string[pair_start..pair_end];
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const value = pair[eq + 1 ..];
+
+        var matched = false;
+        inline for (fields, 0..) |field, i| {
+            if (!matched and !seen[i] and std.mem.eql(u8, key, field.name)) {
+                @field(result, field.name) = try parseValue(field.type, value);
+                seen[i] = true;
+                matched = true;
+            }
+        }
+    }
+
+    inline for (fields, 0..) |field, i| {
+        if (!seen[i] and field.default_value_ptr == null and !isOptional(field.type)) {
+            return error.MissingRequiredQueryParam;
         }
     }
 
@@ -347,4 +402,19 @@ test "typed path integer parser uses route param cache" {
 
     const parsed = try parsePath(PathParams, &req);
     try std.testing.expectEqual(@as(i8, 42), parsed.id);
+}
+
+test "typed query parser uses first value and defaults" {
+    var req = request.Request.init(std.testing.allocator, "GET", "/items?verbose=true&limit=10&verbose=false", &.{}, "");
+
+    const QueryParams = struct {
+        verbose: bool = false,
+        limit: u8,
+        cursor: ?[]const u8 = null,
+    };
+
+    const parsed = try parseQuery(QueryParams, &req);
+    try std.testing.expect(parsed.verbose);
+    try std.testing.expectEqual(@as(u8, 10), parsed.limit);
+    try std.testing.expect(parsed.cursor == null);
 }

@@ -367,6 +367,58 @@ pub const SseWriter = struct {
         data: []const u8,
         id: ?[]const u8,
     ) !void {
+        if (try self.eventBuffered(name, data, id)) return;
+        try self.eventSlow(name, data, id);
+    }
+
+    fn eventBuffered(
+        self: *SseWriter,
+        name: ?[]const u8,
+        data: []const u8,
+        id: ?[]const u8,
+    ) !bool {
+        var buf: [1024]u8 = undefined;
+        var len: usize = 0;
+
+        if (id) |value| {
+            if (!appendSseBytes(&buf, &len, "id: ") or
+                !appendSseBytes(&buf, &len, value) or
+                !appendSseBytes(&buf, &len, "\n"))
+            {
+                return false;
+            }
+        }
+        if (name) |value| {
+            if (!appendSseBytes(&buf, &len, "event: ") or
+                !appendSseBytes(&buf, &len, value) or
+                !appendSseBytes(&buf, &len, "\n"))
+            {
+                return false;
+            }
+        }
+
+        var lines = std.mem.splitScalar(u8, data, '\n');
+        while (lines.next()) |line| {
+            if (!appendSseBytes(&buf, &len, "data: ") or
+                !appendSseBytes(&buf, &len, line) or
+                !appendSseBytes(&buf, &len, "\n"))
+            {
+                return false;
+            }
+        }
+        if (!appendSseBytes(&buf, &len, "\n")) return false;
+
+        try self.ctx.write(buf[0..len]);
+        try self.ctx.flush();
+        return true;
+    }
+
+    fn eventSlow(
+        self: *SseWriter,
+        name: ?[]const u8,
+        data: []const u8,
+        id: ?[]const u8,
+    ) !void {
         if (id) |value| {
             try self.ctx.write("id: ");
             try self.ctx.write(value);
@@ -402,6 +454,13 @@ pub const SseWriter = struct {
         try self.ctx.flush();
     }
 };
+
+fn appendSseBytes(buf: []u8, len: *usize, bytes: []const u8) bool {
+    if (len.* + bytes.len > buf.len) return false;
+    @memcpy(buf[len.*..][0..bytes.len], bytes);
+    len.* += bytes.len;
+    return true;
+}
 
 pub fn jsonError(
     allocator: std.mem.Allocator,

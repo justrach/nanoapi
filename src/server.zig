@@ -186,7 +186,7 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
         };
         defer body.deinit(server.allocator);
 
-        var req = request.Request.initParts(
+        var req = request.Request.initPartsCached(
             server.allocator,
             parsed.method,
             parsed.target,
@@ -194,6 +194,7 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
             parsed.query_string,
             parsed.headers,
             body.bytes,
+            parsed.header_cache,
         );
 
         var res = server.app.handle(&req) catch {
@@ -253,7 +254,7 @@ const Connection = struct {
         };
         defer body.deinit(self.server.allocator);
 
-        var req = request.Request.initParts(
+        var req = request.Request.initPartsCached(
             self.server.allocator,
             parsed.method,
             parsed.target,
@@ -261,6 +262,7 @@ const Connection = struct {
             parsed.query_string,
             parsed.headers,
             body.bytes,
+            parsed.header_cache,
         );
 
         var res = self.server.app.handle(&req) catch {
@@ -280,6 +282,7 @@ const ParsedRequest = struct {
     path: []const u8,
     query_string: []const u8,
     headers: []const request.HeaderPair,
+    header_cache: request.Request.HeaderCache,
     body: []const u8,
     content_length: usize,
     keep_alive: bool,
@@ -303,6 +306,7 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
     var keep_alive = std.mem.eql(u8, version, "HTTP/1.1");
     var send_keep_alive_header = false;
     var header_count: usize = 0;
+    var header_cache = request.Request.HeaderCache.initForBuffer(headers_buf);
     var content_length: usize = 0;
     var pos = first_line_end + 2;
     var body: []const u8 = "";
@@ -335,6 +339,7 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
         const value = trimHeaderWhitespace(buf[colon_pos + 1 .. line_end]);
 
         headers_buf[header_count] = .{ .name = name, .value = value };
+        header_cache.observe(name, header_count);
         header_count += 1;
 
         if (std.ascii.eqlIgnoreCase(name, "connection")) {
@@ -348,12 +353,16 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
         }
     }
 
+    const headers = headers_buf[0..header_count];
+    header_cache.finish(headers);
+
     return .{
         .method = method,
         .target = target,
         .path = path,
         .query_string = query_string,
-        .headers = headers_buf[0..header_count],
+        .headers = headers,
+        .header_cache = header_cache,
         .body = if (body.len > content_length) body[0..content_length] else body,
         .content_length = content_length,
         .keep_alive = keep_alive,
@@ -475,6 +484,16 @@ fn configureAcceptedSocket(fd: c.fd_t) void {
             fd,
             c.SOL.SOCKET,
             c.SO.NOSIGPIPE,
+            &enabled,
+            @sizeOf(@TypeOf(enabled)),
+        );
+    }
+
+    if (@hasDecl(c, "TCP") and @hasDecl(c.TCP, "NODELAY") and @hasDecl(c, "IPPROTO") and @hasDecl(c.IPPROTO, "TCP")) {
+        _ = c.setsockopt(
+            fd,
+            c.IPPROTO.TCP,
+            c.TCP.NODELAY,
             &enabled,
             @sizeOf(@TypeOf(enabled)),
         );
@@ -719,9 +738,8 @@ fn chunkedWrite(sink: *anyopaque, bytes: []const u8) !void {
     const chunked: *ChunkedSink = @ptrCast(@alignCast(sink));
     var header: [32]u8 = undefined;
     const header_bytes = try std.fmt.bufPrint(&header, "{x}\r\n", .{bytes.len});
-    try sendAll(chunked.fd, header_bytes);
-    try sendAll(chunked.fd, bytes);
-    try sendAll(chunked.fd, "\r\n");
+    const parts = [_][]const u8{ header_bytes, bytes, "\r\n" };
+    try sendAllParts(chunked.fd, &parts);
 }
 
 fn chunkedFlush(sink: *anyopaque) !void {
