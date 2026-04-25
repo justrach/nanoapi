@@ -8,8 +8,8 @@
             .hash = "turboapi_core-0.1.0-DjdHgmaTAAC5tl8N6M66vDdnSSS6CPbk6QwhlCLH--PZ",
         },
         .dhi = .{
-            .url = "git+https://github.com/justrach/dhi.git?ref=main#4f607331c51b2ec974310e8cb5d40cf61a8ab6b1",
-            .hash = "dhi-0.1.0-Fz3bn1CFAwDexo2jviNTcIrQeJZ5TM6fCcHcdPIO2wK1",
+            .url = "git+https://github.com/justrach/dhi.git?ref=codex/dhi-fast-validators#ba44a5d04ff0c67dd4d9975963e162c77b13f496",
+            .hash = "dhi-0.1.0-Fz3bn4aKAwDis5C7d-B58ZIR5zy9P38M1einoxEm5IgU",
         },
     },
     .paths = .{""},

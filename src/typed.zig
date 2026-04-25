@@ -143,7 +143,9 @@ fn parseStruct(comptime T: type, req: *const request.Request, comptime location:
         }
     }
 
-    try validateParsed(T, result, req.allocator);
+    if (comptime needsDhiValidation(T)) {
+        try validateParsed(T, result, req.allocator);
+    }
     return result;
 }
 
@@ -193,6 +195,8 @@ fn parseValue(comptime T: type, raw: []const u8) ParseError!T {
 }
 
 fn parseBool(raw: []const u8) ParseError!bool {
+    if (std.mem.eql(u8, raw, "true") or std.mem.eql(u8, raw, "1")) return true;
+    if (std.mem.eql(u8, raw, "false") or std.mem.eql(u8, raw, "0")) return false;
     if (std.ascii.eqlIgnoreCase(raw, "true") or
         std.mem.eql(u8, raw, "1") or
         std.ascii.eqlIgnoreCase(raw, "on") or
@@ -236,6 +240,14 @@ fn schemaType(comptime T: type) meta.SchemaType {
 
 fn isOptional(comptime T: type) bool {
     return @typeInfo(T) == .optional;
+}
+
+fn needsDhiValidation(comptime T: type) bool {
+    inline for (@typeInfo(T).@"struct".fields) |field| {
+        if (std.mem.endsWith(u8, field.name, "_ne")) return true;
+        if (std.mem.eql(u8, field.name, "email") or std.mem.endsWith(u8, field.name, "_email")) return true;
+    }
+    return false;
 }
 
 fn assertStruct(comptime T: type) void {

@@ -79,23 +79,16 @@ pub const Response = struct {
         var body_owned = true;
         errdefer if (body_owned) allocator.free(body);
 
-        const media_type = if (options.media_type) |m| try allocator.dupe(u8, m) else null;
-        var media_owned = true;
-        errdefer if (media_owned) {
-            if (media_type) |m| allocator.free(m);
-        };
-
         var res = Response{
             .allocator = allocator,
             .status_code = options.status_code,
-            .media_type = media_type,
-            .media_type_owned = media_type != null,
+            .media_type = options.media_type,
+            .media_type_owned = false,
             .body = body,
             .body_owned = true,
             .body_kind = .bytes,
         };
         body_owned = false;
-        media_owned = false;
         errdefer res.deinit();
         for (options.headers) |h| {
             try res.addHeader(h.name, h.value);
@@ -132,23 +125,17 @@ pub const Response = struct {
     ) !Response {
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
-        const media_type = if (options.media_type) |m| try allocator.dupe(u8, m) else null;
-        var media_owned = true;
-        errdefer if (media_owned) {
-            if (media_type) |m| allocator.free(m);
-        };
 
         var res = Response{
             .allocator = allocator,
             .status_code = options.status_code,
-            .media_type = media_type,
-            .media_type_owned = media_type != null,
+            .media_type = options.media_type,
+            .media_type_owned = false,
             .body_kind = .file,
             .file_path = owned_path,
             .file_path_owned = true,
             .file_size = size,
         };
-        media_owned = false;
         errdefer res.deinit();
         for (options.headers) |h| {
             try res.addHeader(h.name, h.value);
@@ -161,21 +148,14 @@ pub const Response = struct {
         writer: StreamWriteFn,
         options: ResponseOptions,
     ) !Response {
-        const media_type = if (options.media_type) |m| try allocator.dupe(u8, m) else null;
-        var media_owned = true;
-        errdefer if (media_owned) {
-            if (media_type) |m| allocator.free(m);
-        };
-
         var res = Response{
             .allocator = allocator,
             .status_code = options.status_code,
-            .media_type = media_type,
-            .media_type_owned = media_type != null,
+            .media_type = options.media_type,
+            .media_type_owned = false,
             .body_kind = .stream,
             .stream_writer = writer,
         };
-        media_owned = false;
         errdefer res.deinit();
         for (options.headers) |h| {
             try res.addHeader(h.name, h.value);

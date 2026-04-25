@@ -34,6 +34,26 @@ pub const Request = struct {
         };
     }
 
+    pub fn initParts(
+        allocator: std.mem.Allocator,
+        method: []const u8,
+        target: []const u8,
+        path: []const u8,
+        query_string: []const u8,
+        headers: []const HeaderPair,
+        body: []const u8,
+    ) Request {
+        return .{
+            .allocator = allocator,
+            .method = method,
+            .target = target,
+            .path = path,
+            .query_string = query_string,
+            .headers = headers,
+            .body = body,
+        };
+    }
+
     pub fn setPathParams(self: *Request, params: *const core.RouteParams) void {
         self.path_params = params;
     }

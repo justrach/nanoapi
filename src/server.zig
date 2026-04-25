@@ -186,10 +186,12 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
         };
         defer body.deinit(server.allocator);
 
-        var req = request.Request.init(
+        var req = request.Request.initParts(
             server.allocator,
             parsed.method,
             parsed.target,
+            parsed.path,
+            parsed.query_string,
             parsed.headers,
             body.bytes,
         );
@@ -251,10 +253,12 @@ const Connection = struct {
         };
         defer body.deinit(self.server.allocator);
 
-        var req = request.Request.init(
+        var req = request.Request.initParts(
             self.server.allocator,
             parsed.method,
             parsed.target,
+            parsed.path,
+            parsed.query_string,
             parsed.headers,
             body.bytes,
         );
@@ -273,6 +277,8 @@ const Connection = struct {
 const ParsedRequest = struct {
     method: []const u8,
     target: []const u8,
+    path: []const u8,
+    query_string: []const u8,
     headers: []const request.HeaderPair,
     body: []const u8,
     content_length: usize,
@@ -293,6 +299,9 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
     const method = first_line[0..method_end];
     const target = first_line[method_end + 1 .. version_start];
     const version = first_line[version_start + 1 ..];
+    const query_start = std.mem.indexOfScalar(u8, target, '?');
+    const path = if (query_start) |idx| target[0..idx] else target;
+    const query_string = if (query_start) |idx| target[idx + 1 ..] else "";
 
     var keep_alive = std.mem.eql(u8, version, "HTTP/1.1");
     var header_count: usize = 0;
@@ -321,6 +330,8 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
     return .{
         .method = method,
         .target = target,
+        .path = path,
+        .query_string = query_string,
         .headers = headers_buf[0..header_count],
         .body = if (body.len > content_length) body[0..content_length] else body,
         .content_length = content_length,
@@ -453,6 +464,10 @@ fn recvOnce(fd: c.fd_t, buf: []u8) !usize {
 }
 
 fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool, head_only: bool) !void {
+    if (canUseFastJsonBytes(res, keep_alive, head_only)) {
+        return sendFastJsonBytes(fd, res.body);
+    }
+
     var sender = BufferedSender.init(fd);
 
     var scratch: [256]u8 = undefined;
@@ -521,6 +536,63 @@ fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool, hea
             try sendAll(fd, "0\r\n\r\n");
         },
     }
+}
+
+fn canUseFastJsonBytes(res: *const response.Response, keep_alive: bool, head_only: bool) bool {
+    if (!keep_alive or head_only) return false;
+    if (res.status_code != status.HTTP_200_OK) return false;
+    if (res.body_kind != .bytes) return false;
+    if (res.headers.items.len != 0) return false;
+    const media_type = res.media_type orelse return false;
+    return std.mem.eql(u8, media_type, "application/json");
+}
+
+fn sendFastJsonBytes(fd: c.fd_t, body: []const u8) !void {
+    var buf: [1024]u8 = undefined;
+    var len: usize = 0;
+
+    const prefix = "HTTP/1.1 200 OK\r\nContent-Length: ";
+    const middle = "\r\nConnection: keep-alive\r\nContent-Type: application/json\r\n\r\n";
+    const max_len = prefix.len + 20 + middle.len + body.len;
+    if (max_len > buf.len) {
+        var sender = BufferedSender.init(fd);
+        try sender.append(prefix);
+        len = appendDecimal(buf[0..], body.len);
+        try sender.append(buf[0..len]);
+        try sender.append(middle);
+        try sender.append(body);
+        return sender.flush();
+    }
+
+    @memcpy(buf[len..][0..prefix.len], prefix);
+    len += prefix.len;
+    len += appendDecimal(buf[len..], body.len);
+    @memcpy(buf[len..][0..middle.len], middle);
+    len += middle.len;
+    @memcpy(buf[len..][0..body.len], body);
+    len += body.len;
+
+    try sendAll(fd, buf[0..len]);
+}
+
+fn appendDecimal(out: []u8, value: usize) usize {
+    if (value == 0) {
+        out[0] = '0';
+        return 1;
+    }
+
+    var tmp: [20]u8 = undefined;
+    var n = value;
+    var count: usize = 0;
+    while (n > 0) : (count += 1) {
+        tmp[count] = @intCast('0' + (n % 10));
+        n /= 10;
+    }
+
+    for (0..count) |i| {
+        out[i] = tmp[count - 1 - i];
+    }
+    return count;
 }
 
 fn sendFileBody(fd: c.fd_t, path: []const u8, file_size: u64) !void {
