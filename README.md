@@ -159,6 +159,10 @@ zig build -Doptimize=ReleaseFast http-server -- 8080
 zig build -Doptimize=ReleaseFast http-server -- 8080 event_loop
 ```
 
+The dispatch benchmark covers root dispatch, typed path/query dispatch, exact
+static route lookup at 64 routes, direct typed path/query parsing, request
+header/cookie helpers, typed JSON body parsing, and raw turboapi-core lookup.
+
 Example local `wrk` profile:
 
 ```bash

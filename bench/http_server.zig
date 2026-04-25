@@ -9,6 +9,12 @@ const QueryParams = struct {
     verbose: bool = false,
 };
 
+const BodyModel = struct {
+    user_id: i64,
+    active: bool,
+    name: []const u8,
+};
+
 const Config = struct {
     port: u16 = 8080,
     runtime: nano.server.Runtime = .auto,
@@ -24,6 +30,15 @@ fn user(ctx: nano.typed.Context(PathParams, QueryParams)) anyerror!nano.Response
         ctx.raw.allocator,
         "{{\"user_id\":{d},\"verbose\":{s}}}",
         .{ ctx.path.user_id, if (ctx.query.verbose) "true" else "false" },
+    );
+    return nano.Response.fromOwnedBody(ctx.raw.allocator, body, .{ .media_type = "application/json" });
+}
+
+fn createUser(ctx: nano.typed.ContextWithBody(nano.typed.Empty, nano.typed.Empty, BodyModel)) anyerror!nano.Response {
+    const body = try std.fmt.allocPrint(
+        ctx.raw.allocator,
+        "{{\"user_id\":{d},\"active\":{s},\"name\":\"{s}\"}}",
+        .{ ctx.body.user_id, if (ctx.body.active) "true" else "false", ctx.body.name },
     );
     return nano.Response.fromOwnedBody(ctx.raw.allocator, body, .{ .media_type = "application/json" });
 }
@@ -59,6 +74,7 @@ pub fn main(init: std.process.Init) !void {
 
     try app.get("/", root, .{});
     try app.getTyped(PathParams, QueryParams, "/users/{user_id}", user, .{});
+    try app.postTypedBody(nano.typed.Empty, nano.typed.Empty, BodyModel, "/users", createUser, .{});
     try app.get("/auth", auth, .{});
     try app.get("/events", eventStream, .{});
     try app.get("/file", file, .{});

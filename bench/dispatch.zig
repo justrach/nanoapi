@@ -9,6 +9,25 @@ const QueryParams = struct {
     verbose: bool = false,
 };
 
+const ManyPathParams = struct {
+    org_id: u8,
+    user_id: i64,
+    slug: []const u8,
+};
+
+const ManyQueryParams = struct {
+    verbose: bool = false,
+    limit: u16,
+    offset: u16 = 0,
+    term: []const u8,
+};
+
+const BodyModel = struct {
+    user_id: i64,
+    active: bool,
+    name: []const u8,
+};
+
 const OutputFormat = enum {
     text,
     json,
@@ -58,6 +77,10 @@ fn staticHandler(req: *nano.Request) anyerror!nano.Response {
     return nano.JSONResponse.init(req.allocator, "{\"ok\":true}", .{});
 }
 
+fn staticNoAllocHandler(req: *nano.Request) anyerror!nano.Response {
+    return nano.JSONResponse.static(req.allocator, "{\"ok\":true}", .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const config = try configFromArgs(init.minimal.args);
@@ -74,19 +97,34 @@ pub fn main(init: std.process.Init) !void {
     if (config.warmup > 0) {
         _ = try benchRoute(init.io, "nano dispatch static", &api, &static_req, config.warmup);
         _ = try benchRoute(init.io, "nano dispatch typed param+query", &api, &typed_req, config.warmup);
+        _ = try benchExactStaticRoutes(init.io, allocator, config.warmup);
+        _ = try benchTypedPathParser(init.io, allocator, config.warmup);
+        _ = try benchTypedQueryParser(init.io, allocator, config.warmup);
+        _ = try benchRequestHelpers(init.io, allocator, config.warmup);
+        _ = try benchTypedBodyParser(init.io, allocator, config.warmup);
         _ = try benchCoreRouter(init.io, allocator, config.warmup);
     }
 
     var summaries = [_]BenchSummary{
         .{ .name = "nano dispatch static", .iterations = config.iterations, .repeat = config.repeat },
         .{ .name = "nano dispatch typed param+query", .iterations = config.iterations, .repeat = config.repeat },
+        .{ .name = "nano dispatch exact static x64", .iterations = config.iterations, .repeat = config.repeat },
+        .{ .name = "nano typed parse path multi", .iterations = config.iterations, .repeat = config.repeat },
+        .{ .name = "nano typed parse query multi", .iterations = config.iterations, .repeat = config.repeat },
+        .{ .name = "nano request headers/cookies", .iterations = config.iterations, .repeat = config.repeat },
+        .{ .name = "nano typed parse JSON body", .iterations = config.iterations, .repeat = config.repeat },
         .{ .name = "turboapi-core route lookup", .iterations = config.iterations, .repeat = config.repeat },
     };
 
     for (0..config.repeat) |_| {
         summaries[0].add(try benchRoute(init.io, summaries[0].name, &api, &static_req, config.iterations));
         summaries[1].add(try benchRoute(init.io, summaries[1].name, &api, &typed_req, config.iterations));
-        summaries[2].add(try benchCoreRouter(init.io, allocator, config.iterations));
+        summaries[2].add(try benchExactStaticRoutes(init.io, allocator, config.iterations));
+        summaries[3].add(try benchTypedPathParser(init.io, allocator, config.iterations));
+        summaries[4].add(try benchTypedQueryParser(init.io, allocator, config.iterations));
+        summaries[5].add(try benchRequestHelpers(init.io, allocator, config.iterations));
+        summaries[6].add(try benchTypedBodyParser(init.io, allocator, config.iterations));
+        summaries[7].add(try benchCoreRouter(init.io, allocator, config.iterations));
     }
 
     printSummaries(&summaries, config.format);
@@ -106,6 +144,172 @@ fn benchRoute(io: std.Io, name: []const u8, api: *nano.NanoAPI, req: *nano.Reque
     const elapsed_ns = elapsedNs(start, io);
     return .{
         .name = name,
+        .iterations = iterations,
+        .elapsed_ns = elapsed_ns,
+        .checksum = checksum,
+    };
+}
+
+fn benchExactStaticRoutes(io: std.Io, allocator: std.mem.Allocator, iterations: u64) !BenchResult {
+    var api = try nano.NanoAPI.init(allocator, .{ .title = "Exact route bench" });
+    defer api.deinit();
+
+    var route_buf: [64]u8 = undefined;
+    var route_idx: usize = 0;
+    while (route_idx < 64) : (route_idx += 1) {
+        const path = try std.fmt.bufPrint(&route_buf, "/static-{d}", .{route_idx});
+        try api.get(path, staticNoAllocHandler, .{});
+    }
+
+    var req = nano.Request.init(allocator, "GET", "/static-63", &.{}, "");
+    return benchRoute(io, "nano dispatch exact static x64", &api, &req, iterations);
+}
+
+fn benchTypedPathParser(io: std.Io, allocator: std.mem.Allocator, iterations: u64) !BenchResult {
+    var params = [_]nano.core.RouteParams{ .{}, .{}, .{}, .{} };
+    params[0].put("org_id", "7");
+    params[0].put("user_id", "42");
+    params[0].put("slug", "rach");
+    params[1].put("org_id", "8");
+    params[1].put("user_id", "43");
+    params[1].put("slug", "zig");
+    params[2].put("org_id", "9");
+    params[2].put("user_id", "44");
+    params[2].put("slug", "nano");
+    params[3].put("org_id", "10");
+    params[3].put("user_id", "45");
+    params[3].put("slug", "api");
+
+    var reqs = [_]nano.Request{
+        nano.Request.init(allocator, "GET", "/orgs/7/users/42/rach", &.{}, ""),
+        nano.Request.init(allocator, "GET", "/orgs/8/users/43/zig", &.{}, ""),
+        nano.Request.init(allocator, "GET", "/orgs/9/users/44/nano", &.{}, ""),
+        nano.Request.init(allocator, "GET", "/orgs/10/users/45/api", &.{}, ""),
+    };
+    for (&reqs, 0..) |*req, idx| req.setPathParams(&params[idx]);
+
+    std.mem.doNotOptimizeAway(&params);
+    std.mem.doNotOptimizeAway(&reqs);
+
+    var checksum: u64 = 0;
+    const start = std.Io.Clock.awake.now(io);
+
+    var i: u64 = 0;
+    while (i < iterations) : (i += 1) {
+        const idx: usize = @intCast(i & 3);
+        const parsed = try nano.typed.parsePath(ManyPathParams, &reqs[idx]);
+        checksum +%= @as(u64, parsed.org_id);
+        checksum +%= @intCast(parsed.user_id);
+        checksum +%= parsed.slug.len;
+    }
+
+    const elapsed_ns = elapsedNs(start, io);
+    return .{
+        .name = "nano typed parse path multi",
+        .iterations = iterations,
+        .elapsed_ns = elapsed_ns,
+        .checksum = checksum,
+    };
+}
+
+fn benchTypedQueryParser(io: std.Io, allocator: std.mem.Allocator, iterations: u64) !BenchResult {
+    var reqs = [_]nano.Request{
+        nano.Request.init(allocator, "GET", "/search?verbose=true&limit=10&offset=25&term=zig", &.{}, ""),
+        nano.Request.init(allocator, "GET", "/search?verbose=false&limit=11&offset=26&term=nano", &.{}, ""),
+        nano.Request.init(allocator, "GET", "/search?limit=12&term=api&offset=27&verbose=1", &.{}, ""),
+        nano.Request.init(allocator, "GET", "/search?offset=28&term=bench&limit=13&verbose=0", &.{}, ""),
+    };
+
+    std.mem.doNotOptimizeAway(&reqs);
+
+    var checksum: u64 = 0;
+    const start = std.Io.Clock.awake.now(io);
+
+    var i: u64 = 0;
+    while (i < iterations) : (i += 1) {
+        const idx: usize = @intCast(i & 3);
+        const parsed = try nano.typed.parseQuery(ManyQueryParams, &reqs[idx]);
+        checksum +%= @as(u64, parsed.limit) + parsed.offset + parsed.term.len + @intFromBool(parsed.verbose);
+    }
+
+    const elapsed_ns = elapsedNs(start, io);
+    return .{
+        .name = "nano typed parse query multi",
+        .iterations = iterations,
+        .elapsed_ns = elapsed_ns,
+        .checksum = checksum,
+    };
+}
+
+fn benchRequestHelpers(io: std.Io, allocator: std.mem.Allocator, iterations: u64) !BenchResult {
+    const headers_a = [_]nano.HeaderPair{
+        .{ .name = "Host", .value = "127.0.0.1" },
+        .{ .name = "Authorization", .value = "Bearer bench-token" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Cookie", .value = "session=bench; theme=dark; flags=fast" },
+        .{ .name = "User-Agent", .value = "wrk" },
+    };
+    const headers_b = [_]nano.HeaderPair{
+        .{ .name = "Host", .value = "127.0.0.1" },
+        .{ .name = "Authorization", .value = "Bearer second-token" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Cookie", .value = "session=other; theme=light; flags=typed" },
+        .{ .name = "User-Agent", .value = "wrk" },
+    };
+    var reqs = [_]nano.Request{
+        nano.Request.init(allocator, "GET", "/auth", &headers_a, ""),
+        nano.Request.init(allocator, "GET", "/auth", &headers_b, ""),
+    };
+
+    std.mem.doNotOptimizeAway(&reqs);
+
+    var checksum: u64 = 0;
+    const start = std.Io.Clock.awake.now(io);
+
+    var i: u64 = 0;
+    while (i < iterations) : (i += 1) {
+        const req = &reqs[@intCast(i & 1)];
+        checksum +%= (req.header("authorization") orelse @as([]const u8, "")).len;
+        checksum +%= (req.header("content-type") orelse @as([]const u8, "")).len;
+        checksum +%= (req.header("user-agent") orelse @as([]const u8, "")).len;
+        checksum +%= (req.cookie("session") orelse @as([]const u8, "")).len;
+        checksum +%= (req.cookie("theme") orelse @as([]const u8, "")).len;
+    }
+
+    const elapsed_ns = elapsedNs(start, io);
+    return .{
+        .name = "nano request headers/cookies",
+        .iterations = iterations,
+        .elapsed_ns = elapsed_ns,
+        .checksum = checksum,
+    };
+}
+
+fn benchTypedBodyParser(io: std.Io, allocator: std.mem.Allocator, iterations: u64) !BenchResult {
+    var reqs = [_]nano.Request{
+        nano.Request.init(allocator, "POST", "/users", &.{}, "{\"user_id\":42,\"active\":true,\"name\":\"rach\"}"),
+        nano.Request.init(allocator, "POST", "/users", &.{}, "{\"user_id\":43,\"active\":false,\"name\":\"zig\"}"),
+        nano.Request.init(allocator, "POST", "/users", &.{}, "{\"user_id\":44,\"active\":true,\"name\":\"nano\"}"),
+        nano.Request.init(allocator, "POST", "/users", &.{}, "{\"user_id\":45,\"active\":false,\"name\":\"api\"}"),
+    };
+
+    std.mem.doNotOptimizeAway(&reqs);
+
+    var checksum: u64 = 0;
+    const start = std.Io.Clock.awake.now(io);
+
+    var i: u64 = 0;
+    while (i < iterations) : (i += 1) {
+        const idx: usize = @intCast(i & 3);
+        const parsed = try nano.typed.parseBody(BodyModel, &reqs[idx]);
+        checksum +%= @intCast(parsed.user_id);
+        checksum +%= @intFromBool(parsed.active);
+        checksum +%= parsed.name.len;
+    }
+
+    const elapsed_ns = elapsedNs(start, io);
+    return .{
+        .name = "nano typed parse JSON body",
         .iterations = iterations,
         .elapsed_ns = elapsed_ns,
         .checksum = checksum,

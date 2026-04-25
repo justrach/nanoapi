@@ -14,6 +14,7 @@ if ! command -v wrk >/dev/null 2>&1; then
 fi
 
 mkdir -p "$OUT_DIR"
+post_lua=""
 
 server_args=("$PORT")
 if [[ "$RUNTIME" != "auto" ]]; then
@@ -26,6 +27,7 @@ server_pid=$!
 cleanup() {
   kill "$server_pid" >/dev/null 2>&1 || true
   wait "$server_pid" >/dev/null 2>&1 || true
+  [[ -z "$post_lua" ]] || rm -f "$post_lua"
 }
 trap cleanup EXIT
 
@@ -38,6 +40,12 @@ done
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 result="${OUT_DIR}/http-${stamp}.txt"
+post_lua="$(mktemp "${OUT_DIR}/wrk-post-json.XXXXXX.lua")"
+cat >"$post_lua" <<'LUA'
+wrk.method = "POST"
+wrk.body = '{"user_id":42,"active":true,"name":"rach"}'
+wrk.headers["Content-Type"] = "application/json"
+LUA
 
 {
   echo "nanoapi HTTP benchmark"
@@ -56,6 +64,10 @@ result="${OUT_DIR}/http-${stamp}.txt"
 
   echo "## GET /users/42?verbose=true"
   wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" --latency "http://127.0.0.1:${PORT}/users/42?verbose=true"
+  echo
+
+  echo "## POST /users"
+  wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" --latency -s "$post_lua" "http://127.0.0.1:${PORT}/users"
   echo
 
   echo "## GET /auth"
