@@ -18,6 +18,8 @@ pub const Options = struct {
     read_buffer_size: usize = 16 * 1024,
     max_headers: usize = 64,
     runtime: Runtime = .auto,
+    /// Number of event-loop workers. 0 means one worker per logical CPU.
+    worker_threads: usize = 0,
 };
 
 pub const Runtime = enum {
@@ -67,7 +69,7 @@ pub const Server = struct {
     }
 
     fn listenAndServeThreaded(self: *Server) !void {
-        self.listen_fd = try createListenSocket(self.options);
+        self.listen_fd = try createListenSocket(self.options, false);
 
         while (true) {
             const fd = c.accept(self.listen_fd, null, null);
@@ -88,8 +90,26 @@ pub const Server = struct {
     }
 
     fn listenAndServeEventLoop(self: *Server) !void {
-        self.listen_fd = try createListenSocket(self.options);
+        const worker_count = effectiveWorkerCount(self.options.worker_threads);
+        if (worker_count > 1) return self.listenAndServeEventLoopWorkers(worker_count);
 
+        self.listen_fd = try createListenSocket(self.options, false);
+        return self.runEventLoop(self.listen_fd);
+    }
+
+    fn listenAndServeEventLoopWorkers(self: *Server, worker_count: usize) !void {
+        var worker_index: usize = 1;
+        while (worker_index < worker_count) : (worker_index += 1) {
+            const thread = try std.Thread.spawn(.{}, eventLoopWorker, .{ self, worker_index });
+            thread.detach();
+        }
+
+        const listen_fd = try createListenSocket(self.options, true);
+        defer _ = close(listen_fd);
+        try self.runEventLoop(listen_fd);
+    }
+
+    fn runEventLoop(self: *Server, listen_fd: c.fd_t) !void {
         const kq = c.kqueue();
         switch (c.errno(kq)) {
             .SUCCESS => {},
@@ -97,7 +117,7 @@ pub const Server = struct {
         }
         defer _ = close(kq);
 
-        try registerRead(kq, self.listen_fd, 0);
+        try registerRead(kq, listen_fd, 0);
 
         var connections = std.AutoHashMap(c.fd_t, *Connection).init(self.allocator);
         defer {
@@ -116,8 +136,8 @@ pub const Server = struct {
             }
 
             for (events[0..@intCast(n)]) |ev| {
-                if (ev.ident == @as(usize, @intCast(self.listen_fd))) {
-                    const fd = c.accept(self.listen_fd, null, null);
+                if (ev.ident == @as(usize, @intCast(listen_fd))) {
+                    const fd = c.accept(listen_fd, null, null);
                     switch (c.errno(fd)) {
                         .SUCCESS => {},
                         .INTR, .AGAIN => continue,
@@ -156,6 +176,27 @@ pub const Server = struct {
         }
     }
 };
+
+fn eventLoopWorker(server: *Server, worker_index: usize) void {
+    const listen_fd = createListenSocket(server.options, true) catch |err| {
+        if (builtin.mode == .Debug) {
+            std.debug.print("event-loop worker {d} failed to listen: {t}\n", .{ worker_index, err });
+        }
+        return;
+    };
+    defer _ = close(listen_fd);
+
+    server.runEventLoop(listen_fd) catch |err| {
+        if (builtin.mode == .Debug) {
+            std.debug.print("event-loop worker {d} stopped: {t}\n", .{ worker_index, err });
+        }
+    };
+}
+
+fn effectiveWorkerCount(configured: usize) usize {
+    if (configured != 0) return @max(configured, 1);
+    return @max(std.Thread.getCpuCount() catch 1, 1);
+}
 
 pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, options: Options) !void {
     var server = Server.init(app, allocator, options);
@@ -466,7 +507,7 @@ fn readFullBody(
     return .{ .bytes = body, .owned = true };
 }
 
-fn createListenSocket(options: Options) !c.fd_t {
+fn createListenSocket(options: Options, reuse_port: bool) !c.fd_t {
     const fd = socket(c.AF.INET, c.SOCK.STREAM, 0);
     switch (c.errno(fd)) {
         .SUCCESS => {},
@@ -482,6 +523,16 @@ fn createListenSocket(options: Options) !c.fd_t {
         &reuse,
         @sizeOf(@TypeOf(reuse)),
     );
+
+    if (reuse_port and @hasDecl(c.SO, "REUSEPORT")) {
+        _ = c.setsockopt(
+            fd,
+            c.SOL.SOCKET,
+            c.SO.REUSEPORT,
+            &reuse,
+            @sizeOf(@TypeOf(reuse)),
+        );
+    }
 
     if (@hasDecl(c.SO, "NOSIGPIPE")) {
         var no_sigpipe: c_int = 1;

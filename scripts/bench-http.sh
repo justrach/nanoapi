@@ -6,6 +6,7 @@ DURATION="${DURATION:-10s}"
 THREADS="${THREADS:-4}"
 CONNECTIONS="${CONNECTIONS:-64}"
 RUNTIME="${RUNTIME:-auto}"
+WORKERS="${WORKERS:-0}"
 OUT_DIR="${OUT_DIR:-bench-results}"
 
 if ! command -v wrk >/dev/null 2>&1; then
@@ -17,8 +18,11 @@ mkdir -p "$OUT_DIR"
 post_lua=""
 
 server_args=("$PORT")
-if [[ "$RUNTIME" != "auto" ]]; then
+if [[ "$RUNTIME" != "auto" || "$WORKERS" != "0" ]]; then
   server_args+=("$RUNTIME")
+fi
+if [[ "$WORKERS" != "0" ]]; then
+  server_args+=("$WORKERS")
 fi
 
 zig build -Doptimize=ReleaseFast http-server -- "${server_args[@]}" &
@@ -53,6 +57,7 @@ LUA
   echo "git_sha=$(git rev-parse --short HEAD)"
   echo "zig_version=$(zig version)"
   echo "runtime=${RUNTIME}"
+  echo "worker_threads=${WORKERS}"
   echo "threads=${THREADS}"
   echo "connections=${CONNECTIONS}"
   echo "duration=${DURATION}"

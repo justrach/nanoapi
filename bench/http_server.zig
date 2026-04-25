@@ -18,6 +18,7 @@ const BodyModel = struct {
 const Config = struct {
     port: u16 = 8080,
     runtime: nano.server.Runtime = .auto,
+    worker_threads: usize = 0,
     check_only: bool = false,
 };
 
@@ -45,8 +46,8 @@ fn createUser(ctx: nano.typed.ContextWithBody(nano.typed.Empty, nano.typed.Empty
 
 fn auth(req: *nano.Request) anyerror!nano.Response {
     const bearer = req.header("authorization") orelse "";
-    const session = req.cookie("session") orelse "";
-    if (bearer.len == 0 or session.len == 0) {
+    const cookie = req.header("cookie") orelse "";
+    if (bearer.len == 0 or std.mem.indexOf(u8, cookie, "session=") == null) {
         return nano.JSONResponse.static(req.allocator, "{\"authorized\":false}", .{});
     }
     return nano.JSONResponse.static(req.allocator, "{\"authorized\":true}", .{});
@@ -82,10 +83,14 @@ pub fn main(init: std.process.Init) !void {
     if (config.check_only) return;
 
     std.debug.print(
-        "nanoapi HTTP benchmark server listening on http://127.0.0.1:{d} runtime={t}\n",
-        .{ config.port, config.runtime },
+        "nanoapi HTTP benchmark server listening on http://127.0.0.1:{d} runtime={t} workers={d}\n",
+        .{ config.port, config.runtime, config.worker_threads },
     );
-    try nano.server.serve(&app, allocator, .{ .port = config.port, .runtime = config.runtime });
+    try nano.server.serve(&app, allocator, .{
+        .port = config.port,
+        .runtime = config.runtime,
+        .worker_threads = config.worker_threads,
+    });
 }
 
 fn configFromArgs(args_state: std.process.Args) !Config {
@@ -95,14 +100,18 @@ fn configFromArgs(args_state: std.process.Args) !Config {
 
     var config: Config = .{};
     var saw_port = false;
+    var saw_runtime = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--check")) {
             config.check_only = true;
         } else if (!saw_port) {
             config.port = try std.fmt.parseInt(u16, arg, 10);
             saw_port = true;
-        } else {
+        } else if (!saw_runtime) {
             config.runtime = try parseRuntime(arg);
+            saw_runtime = true;
+        } else {
+            config.worker_threads = try std.fmt.parseInt(usize, arg, 10);
         }
     }
     return config;
