@@ -165,6 +165,7 @@ Example local `wrk` profile:
 wrk -t4 -c64 -d10s --latency http://127.0.0.1:8080/
 wrk -t4 -c64 -d10s --latency 'http://127.0.0.1:8080/users/42?verbose=true'
 ./scripts/bench-http.sh
+./scripts/check-dispatch-bench.sh
 ```
 
 ## Feature Shape
