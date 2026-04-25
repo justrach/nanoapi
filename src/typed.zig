@@ -73,7 +73,10 @@ pub fn get(
 }
 
 pub fn parsePath(comptime T: type, req: *const request.Request) ParseError!T {
-    return parseStruct(T, req, .path);
+    assertStruct(T);
+    const fields = @typeInfo(T).@"struct".fields;
+    if (comptime fields.len <= 1) return parseStruct(T, req, .path);
+    return parsePathStruct(T, req);
 }
 
 pub fn parseQuery(comptime T: type, req: *const request.Request) ParseError!T {
@@ -195,6 +198,57 @@ fn parseQueryStruct(comptime T: type, req: *const request.Request) ParseError!T 
         try validateParsed(T, result, req.allocator);
     }
     return result;
+}
+
+fn parsePathStruct(comptime T: type, req: *const request.Request) ParseError!T {
+    assertStruct(T);
+
+    const fields = @typeInfo(T).@"struct".fields;
+    if (comptime fields.len == 0) return .{};
+
+    var result: T = undefined;
+    var seen = [_]bool{false} ** fields.len;
+
+    inline for (fields, 0..) |field, i| {
+        if (field.defaultValue()) |default| {
+            @field(result, field.name) = default;
+        } else if (comptime isOptional(field.type)) {
+            @field(result, field.name) = null;
+        } else {
+            seen[i] = false;
+        }
+    }
+
+    const params = req.path_params orelse return error.MissingRequiredPathParam;
+    for (params.entries()) |param| {
+        var matched = false;
+        inline for (fields, 0..) |field, i| {
+            if (!matched and !seen[i] and std.mem.eql(u8, param.key, field.name)) {
+                @field(result, field.name) = try parsePathParamValue(field.type, param);
+                seen[i] = true;
+                matched = true;
+            }
+        }
+    }
+
+    inline for (fields, 0..) |field, i| {
+        if (!seen[i] and field.default_value_ptr == null and !isOptional(field.type)) {
+            return error.MissingRequiredPathParam;
+        }
+    }
+
+    if (comptime needsDhiValidation(T)) {
+        try validateParsed(T, result, req.allocator);
+    }
+    return result;
+}
+
+fn parsePathParamValue(comptime T: type, param: @import("turboapi-core").RouteParam) ParseError!T {
+    if (comptime valueKind(T) == .int) {
+        if (!param.has_int_value) return error.UnsupportedParamType;
+        return std.math.cast(T, param.int_value) orelse error.UnsupportedParamType;
+    }
+    return parseValue(T, param.value);
 }
 
 fn validateParsed(comptime T: type, value: T, allocator: std.mem.Allocator) ParseError!void {
@@ -402,6 +456,28 @@ test "typed path integer parser uses route param cache" {
 
     const parsed = try parsePath(PathParams, &req);
     try std.testing.expectEqual(@as(i8, 42), parsed.id);
+}
+
+test "typed path parser scans route params once for multiple fields" {
+    const core = @import("turboapi-core");
+
+    var req = request.Request.init(std.testing.allocator, "GET", "/orgs/7/users/42", &.{}, "");
+    var params = core.RouteParams{};
+    params.put("org_id", "7");
+    params.put("user_id", "42");
+    params.put("slug", "rach");
+    req.setPathParams(&params);
+
+    const PathParams = struct {
+        org_id: u8,
+        user_id: i16,
+        slug: []const u8,
+    };
+
+    const parsed = try parsePath(PathParams, &req);
+    try std.testing.expectEqual(@as(u8, 7), parsed.org_id);
+    try std.testing.expectEqual(@as(i16, 42), parsed.user_id);
+    try std.testing.expectEqualStrings("rach", parsed.slug);
 }
 
 test "typed query parser uses first value and defaults" {
