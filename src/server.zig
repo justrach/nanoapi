@@ -166,19 +166,26 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, options: Options) 
 fn handleConnection(server: *Server, fd: c.fd_t) void {
     defer _ = close(fd);
 
-    const buf = server.allocator.alloc(u8, server.options.read_buffer_size) catch return;
-    defer server.allocator.free(buf);
+    var input = InputBuffer{
+        .buf = server.allocator.alloc(u8, server.options.read_buffer_size) catch return,
+    };
+    defer server.allocator.free(input.buf);
 
     const headers = server.allocator.alloc(request.HeaderPair, server.options.max_headers) catch return;
     defer server.allocator.free(headers);
 
-    while (true) {
-        const n = recvOnce(fd, buf) catch return;
-        if (n == 0) return;
+    if ((input.readAppend(fd) catch return) == false) return;
 
-        const parsed = parseRequestHead(buf[0..n], headers) catch {
-            sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
-            return;
+    while (true) {
+        const parsed = parseRequestHead(input.bytes(), headers) catch |err| switch (err) {
+            error.IncompleteRequestHead => {
+                if ((input.readAppend(fd) catch return) == false) return;
+                continue;
+            },
+            else => {
+                sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+                return;
+            },
         };
         const body = readFullBody(server.allocator, fd, parsed) catch {
             sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
@@ -205,13 +212,15 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
 
         sendResponse(fd, &res, parsed.keep_alive, parsed.send_keep_alive_header, std.mem.eql(u8, parsed.method, "HEAD")) catch return;
         if (!parsed.keep_alive) return;
+        input.consume(parsed.consumed_len);
+        if (input.len == 0 and (input.readAppend(fd) catch return) == false) return;
     }
 }
 
 const Connection = struct {
     server: *Server,
     fd: c.fd_t,
-    buf: []u8,
+    input: InputBuffer,
     headers: []request.HeaderPair,
 
     fn create(server: *Server, fd: c.fd_t) !*Connection {
@@ -227,7 +236,7 @@ const Connection = struct {
         conn.* = .{
             .server = server,
             .fd = fd,
-            .buf = buf,
+            .input = .{ .buf = buf },
             .headers = headers,
         };
         return conn;
@@ -236,43 +245,81 @@ const Connection = struct {
     fn deinit(self: *Connection) void {
         _ = close(self.fd);
         self.server.allocator.free(self.headers);
-        self.server.allocator.free(self.buf);
+        self.server.allocator.free(self.input.buf);
         self.server.allocator.destroy(self);
     }
 
     fn handleReadable(self: *Connection) bool {
-        const n = recvOnce(self.fd, self.buf) catch return false;
+        if ((self.input.readAppend(self.fd) catch return false) == false) return false;
+
+        while (self.input.len > 0) {
+            const parsed = parseRequestHead(self.input.bytes(), self.headers) catch |err| switch (err) {
+                error.IncompleteRequestHead => return true,
+                else => {
+                    sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+                    return false;
+                },
+            };
+
+            if (parsed.body.len < parsed.content_length and parsed.body_start + parsed.content_length <= self.input.buf.len) {
+                return true;
+            }
+
+            const body = readFullBody(self.server.allocator, self.fd, parsed) catch {
+                sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+                return false;
+            };
+            defer body.deinit(self.server.allocator);
+
+            var req = request.Request.initPartsCached(
+                self.server.allocator,
+                parsed.method,
+                parsed.target,
+                parsed.path,
+                parsed.query_string,
+                parsed.headers,
+                body.bytes,
+                parsed.header_cache,
+            );
+
+            var res = self.server.app.handle(&req) catch {
+                sendError(self.fd, status.HTTP_500_INTERNAL_SERVER_ERROR, "Internal Server Error") catch {};
+                return false;
+            };
+            defer res.deinit();
+
+            sendResponse(self.fd, &res, parsed.keep_alive, parsed.send_keep_alive_header, std.mem.eql(u8, parsed.method, "HEAD")) catch return false;
+            if (!parsed.keep_alive) return false;
+            self.input.consume(parsed.consumed_len);
+        }
+        return true;
+    }
+};
+
+const InputBuffer = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn bytes(self: *const InputBuffer) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn readAppend(self: *InputBuffer, fd: c.fd_t) !bool {
+        if (self.len == self.buf.len) return error.RequestBufferFull;
+        const n = try recvOnce(fd, self.buf[self.len..]);
         if (n == 0) return false;
+        self.len += n;
+        return true;
+    }
 
-        const parsed = parseRequestHead(self.buf[0..n], self.headers) catch {
-            sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
-            return false;
-        };
-        const body = readFullBody(self.server.allocator, self.fd, parsed) catch {
-            sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
-            return false;
-        };
-        defer body.deinit(self.server.allocator);
-
-        var req = request.Request.initPartsCached(
-            self.server.allocator,
-            parsed.method,
-            parsed.target,
-            parsed.path,
-            parsed.query_string,
-            parsed.headers,
-            body.bytes,
-            parsed.header_cache,
-        );
-
-        var res = self.server.app.handle(&req) catch {
-            sendError(self.fd, status.HTTP_500_INTERNAL_SERVER_ERROR, "Internal Server Error") catch {};
-            return false;
-        };
-        defer res.deinit();
-
-        sendResponse(self.fd, &res, parsed.keep_alive, parsed.send_keep_alive_header, std.mem.eql(u8, parsed.method, "HEAD")) catch return false;
-        return parsed.keep_alive;
+    fn consume(self: *InputBuffer, amount: usize) void {
+        if (amount >= self.len) {
+            self.len = 0;
+            return;
+        }
+        const remaining = self.len - amount;
+        std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[amount..self.len]);
+        self.len = remaining;
     }
 };
 
@@ -284,6 +331,8 @@ const ParsedRequest = struct {
     headers: []const request.HeaderPair,
     header_cache: request.Request.HeaderCache,
     body: []const u8,
+    body_start: usize,
+    consumed_len: usize,
     content_length: usize,
     keep_alive: bool,
     send_keep_alive_header: bool,
@@ -309,12 +358,14 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
     var header_cache = request.Request.HeaderCache.initForBuffer(headers_buf);
     var content_length: usize = 0;
     var pos = first_line_end + 2;
+    var body_start: usize = 0;
     var body: []const u8 = "";
 
     while (true) {
         if (pos + 1 >= buf.len) return error.IncompleteRequestHead;
         if (buf[pos] == '\r' and buf[pos + 1] == '\n') {
-            body = buf[pos + 2 ..];
+            body_start = pos + 2;
+            body = buf[body_start..];
             break;
         }
         if (header_count >= headers_buf.len) return error.TooManyHeaders;
@@ -355,6 +406,8 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
 
     const headers = headers_buf[0..header_count];
     header_cache.finish(headers);
+    const body_len = @min(body.len, content_length);
+    const consumed_len = if (body.len >= content_length) body_start + content_length else buf.len;
 
     return .{
         .method = method,
@@ -363,7 +416,9 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
         .query_string = query_string,
         .headers = headers,
         .header_cache = header_cache,
-        .body = if (body.len > content_length) body[0..content_length] else body,
+        .body = body[0..body_len],
+        .body_start = body_start,
+        .consumed_len = consumed_len,
         .content_length = content_length,
         .keep_alive = keep_alive,
         .send_keep_alive_header = send_keep_alive_header,
@@ -857,4 +912,26 @@ test "parse HTTP request content length" {
     try std.testing.expectEqualStrings("POST", parsed.method);
     try std.testing.expectEqual(@as(usize, 5), parsed.content_length);
     try std.testing.expectEqualStrings("hello", parsed.body);
+}
+
+test "parse HTTP request preserves pipelined bytes after body" {
+    var headers: [8]request.HeaderPair = undefined;
+    const bytes =
+        "POST /upload HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello" ++
+        "GET /next HTTP/1.1\r\n\r\n";
+    const parsed = try parseRequestHead(bytes, &headers);
+
+    try std.testing.expectEqual(@as(usize, 5), parsed.content_length);
+    try std.testing.expectEqualStrings("hello", parsed.body);
+    try std.testing.expectEqualStrings("GET /next HTTP/1.1\r\n\r\n", bytes[parsed.consumed_len..]);
+}
+
+test "parse HTTP request consumes zero-body request before pipeline" {
+    var headers: [8]request.HeaderPair = undefined;
+    const bytes = "GET / HTTP/1.1\r\n\r\nGET /next HTTP/1.1\r\n\r\n";
+    const parsed = try parseRequestHead(bytes, &headers);
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.content_length);
+    try std.testing.expectEqual(@as(usize, 0), parsed.body.len);
+    try std.testing.expectEqualStrings("GET /next HTTP/1.1\r\n\r\n", bytes[parsed.consumed_len..]);
 }
