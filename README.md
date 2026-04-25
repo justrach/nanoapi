@@ -8,6 +8,28 @@ The hot routing path is backed by `turboapi-core`, while validation primitives
 come from `dhi`. The current dependency pin uses the `dhi` performance branch
 from `justrach/dhi#54`; switch it back to `dhi` main once that PR lands.
 
+## Install
+
+For local development, clone the repo and run the standard Zig build steps:
+
+```bash
+git clone https://github.com/justrach/nanoapi.git
+cd nanoapi
+zig build test
+```
+
+To consume NanoAPI from another Zig package, add it as a dependency and import
+the `nanoapi` module from your `build.zig`:
+
+```zig
+const nano_dep = b.dependency("nanoapi", .{
+    .target = target,
+    .optimize = optimize,
+});
+
+exe.root_module.addImport("nanoapi", nano_dep.module("nanoapi"));
+```
+
 ## Quick Start
 
 ```zig
@@ -102,6 +124,31 @@ try app.listenAndServe(std.heap.smp_allocator, .{
 });
 ```
 
+## Performance
+
+NanoAPI is currently optimized around a small number of hot paths:
+
+- exact `GET /` dispatch avoids the radix router entirely
+- exact static routes are cached before falling through to parameterized routing
+- parsed request path/query slices are threaded into `Request`
+- typed routes skip DHI validation when no validation convention is present
+- common `200 application/json` byte responses use a compact fast write path
+- HTTP/1.1 keep-alive responses avoid redundant connection headers
+
+Recent local comparison against `karlseguin/http.zig` using equivalent handlers:
+
+| Route | NanoAPI | http.zig |
+| --- | ---: | ---: |
+| `/` | ~168k req/s | ~166k req/s |
+| `/users/42?verbose=true` | ~167k req/s | ~166k req/s |
+
+Treat these numbers as directional; they vary by machine, thermal state, Zig
+build, and background load.
+
+The next likely performance wins are request/response arena reuse, vectorized or
+lower-copy writes, better request parser state reuse, specialized typed query
+parsers, and a reproducible benchmark suite with regression thresholds.
+
 ## Build And Bench
 
 ```bash
@@ -116,16 +163,6 @@ Example local `wrk` profile:
 wrk -t4 -c64 -d10s --latency http://127.0.0.1:8080/
 wrk -t4 -c64 -d10s --latency 'http://127.0.0.1:8080/users/42?verbose=true'
 ```
-
-Recent local comparison against `karlseguin/http.zig` using equivalent handlers:
-
-| Route | NanoAPI | http.zig |
-| --- | ---: | ---: |
-| `/` | ~168k req/s | ~166k req/s |
-| `/users/42?verbose=true` | ~167k req/s | ~166k req/s |
-
-Treat these numbers as directional; they vary by machine, thermal state, Zig
-build, and background load.
 
 ## Feature Shape
 
