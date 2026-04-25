@@ -9,6 +9,19 @@ const QueryParams = struct {
     verbose: bool = false,
 };
 
+const BodyModel = struct {
+    user_id: i64,
+    active: bool,
+    name: []const u8,
+};
+
+const Config = struct {
+    port: u16 = 8080,
+    runtime: nano.server.Runtime = .auto,
+    worker_threads: usize = 0,
+    check_only: bool = false,
+};
+
 fn root(req: *nano.Request) anyerror!nano.Response {
     return nano.JSONResponse.static(req.allocator, "{\"ok\":true}", .{});
 }
@@ -22,24 +35,91 @@ fn user(ctx: nano.typed.Context(PathParams, QueryParams)) anyerror!nano.Response
     return nano.Response.fromOwnedBody(ctx.raw.allocator, body, .{ .media_type = "application/json" });
 }
 
+fn createUser(ctx: nano.typed.ContextWithBody(nano.typed.Empty, nano.typed.Empty, BodyModel)) anyerror!nano.Response {
+    const body = try std.fmt.allocPrint(
+        ctx.raw.allocator,
+        "{{\"user_id\":{d},\"active\":{s},\"name\":\"{s}\"}}",
+        .{ ctx.body.user_id, if (ctx.body.active) "true" else "false", ctx.body.name },
+    );
+    return nano.Response.fromOwnedBody(ctx.raw.allocator, body, .{ .media_type = "application/json" });
+}
+
+fn auth(req: *nano.Request) anyerror!nano.Response {
+    const bearer = req.header("authorization") orelse "";
+    const cookie = req.header("cookie") orelse "";
+    if (bearer.len == 0 or std.mem.indexOf(u8, cookie, "session=") == null) {
+        return nano.JSONResponse.static(req.allocator, "{\"authorized\":false}", .{});
+    }
+    return nano.JSONResponse.static(req.allocator, "{\"authorized\":true}", .{});
+}
+
+fn events(ctx: *nano.StreamContext) anyerror!void {
+    var writer = nano.SseWriter.init(ctx);
+    try writer.event("ready", "1", "1");
+}
+
+fn eventStream(req: *nano.Request) anyerror!nano.Response {
+    return nano.EventSourceResponse.init(req.allocator, events, .{});
+}
+
+fn file(req: *nano.Request) anyerror!nano.Response {
+    return nano.FileResponse.init(req.allocator, "README.md", null, .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
-    const port = try portFromArgs(init.minimal.args);
+    const config = try configFromArgs(init.minimal.args);
 
     var app = try nano.NanoAPI.init(allocator, .{ .title = "NanoAPI wrk bench" });
     defer app.deinit();
 
     try app.get("/", root, .{});
     try app.getTyped(PathParams, QueryParams, "/users/{user_id}", user, .{});
+    try app.postTypedBody(nano.typed.Empty, nano.typed.Empty, BodyModel, "/users", createUser, .{});
+    try app.get("/auth", auth, .{});
+    try app.get("/events", eventStream, .{});
+    try app.get("/file", file, .{});
 
-    std.debug.print("nanoapi HTTP benchmark server listening on http://127.0.0.1:{d}\n", .{port});
-    try nano.server.serve(&app, allocator, .{ .port = port });
+    if (config.check_only) return;
+
+    std.debug.print(
+        "nanoapi HTTP benchmark server listening on http://127.0.0.1:{d} runtime={t} workers={d}\n",
+        .{ config.port, config.runtime, config.worker_threads },
+    );
+    try nano.server.serve(&app, allocator, .{
+        .port = config.port,
+        .runtime = config.runtime,
+        .worker_threads = config.worker_threads,
+    });
 }
 
-fn portFromArgs(args_state: std.process.Args) !u16 {
+fn configFromArgs(args_state: std.process.Args) !Config {
     var args = std.process.Args.Iterator.init(args_state);
     defer args.deinit();
     _ = args.next();
-    const raw = args.next() orelse return 8080;
-    return try std.fmt.parseInt(u16, raw, 10);
+
+    var config: Config = .{};
+    var saw_port = false;
+    var saw_runtime = false;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--check")) {
+            config.check_only = true;
+        } else if (!saw_port) {
+            config.port = try std.fmt.parseInt(u16, arg, 10);
+            saw_port = true;
+        } else if (!saw_runtime) {
+            config.runtime = try parseRuntime(arg);
+            saw_runtime = true;
+        } else {
+            config.worker_threads = try std.fmt.parseInt(usize, arg, 10);
+        }
+    }
+    return config;
+}
+
+fn parseRuntime(raw: []const u8) !nano.server.Runtime {
+    if (std.mem.eql(u8, raw, "auto")) return .auto;
+    if (std.mem.eql(u8, raw, "event_loop")) return .event_loop;
+    if (std.mem.eql(u8, raw, "thread_per_connection")) return .thread_per_connection;
+    return error.InvalidRuntime;
 }

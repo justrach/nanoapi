@@ -2,7 +2,7 @@
 
 NanoAPI is a pure Zig HTTP API framework with FastAPI-inspired ergonomics:
 typed route parameters, response helpers, OpenAPI metadata, streaming responses,
-and a small native HTTP/1.1 server.
+and a small multi-worker native HTTP/1.1 server.
 
 The hot routing path is backed by `turboapi-core`, while validation primitives
 come from `dhi`. The current dependency pin uses the `dhi` performance branch
@@ -111,7 +111,9 @@ fn download(req: *nano.Request) !nano.Response {
 The built-in server is a compact HTTP/1.1 implementation with keep-alive. The
 default runtime is `.auto`: on macOS and BSD targets it uses the kqueue event
 loop; elsewhere it falls back to thread-per-connection until another event
-backend is added.
+backend is added. The event-loop runtime is multicore by default: worker count
+`0` means one listener/loop per logical CPU using `SO_REUSEPORT` where the OS
+supports it.
 
 The hot response path avoids unnecessary allocations and omits redundant
 `Connection: keep-alive` headers for HTTP/1.1 responses.
@@ -121,6 +123,7 @@ try app.listenAndServe(std.heap.smp_allocator, .{
     .host = .{ 127, 0, 0, 1 },
     .port = 8080,
     .runtime = .auto,
+    .worker_threads = 0,
 });
 ```
 
@@ -134,34 +137,60 @@ NanoAPI is currently optimized around a small number of hot paths:
 - typed routes skip DHI validation when no validation convention is present
 - common `200 application/json` byte responses use a compact fast write path
 - HTTP/1.1 keep-alive responses avoid redundant connection headers
+- kqueue event-loop workers can spread accepted connections across cores
 
-Recent local comparison against `karlseguin/http.zig` using equivalent handlers:
+Recent local comparison using equivalent JSON handlers:
 
-| Route | NanoAPI | http.zig |
-| --- | ---: | ---: |
-| `/` | ~168k req/s | ~166k req/s |
-| `/users/42?verbose=true` | ~167k req/s | ~166k req/s |
+Environment: macOS arm64, Zig 0.16.0, `wrk 4.2.0`, `-t4 -c64 -d3s`.
+NanoAPI used `event_loop` with `worker_threads=0` (auto). The Rust comparison
+servers used 4 workers.
+
+| Framework | `/` | `/users/42?verbose=true` | `/auth` | Average | vs NanoAPI |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| NanoAPI | 148.1k | 149.5k | 149.4k | 149.0k | 1.00x |
+| Rust Actix Web | 152.7k | 151.1k | 151.9k | 151.9k | 1.02x |
+| Rust xitca-web | 152.6k | 150.5k | 150.6k | 151.3k | 1.02x |
+| turboAPI | 146.7k | 146.0k | 127.1k | 139.9k | 0.94x |
+| http.zig | 130.8k | 129.5k | 132.7k | 131.0k | 0.88x |
+| Go Fiber | 110.9k | 110.3k | 110.9k | 110.7k | 0.74x |
+| Go net/http | 99.8k | 96.7k | 92.8k | 96.4k | 0.65x |
+| FastAPI + uvicorn | 10.1k | 8.7k | 8.7k | 9.1k | 0.06x |
+
+Higher client concurrency was not better on this localhost profile. With
+`wrk -t8 -c128 -d5s`, NanoAPI averaged 134.6k req/s, Actix averaged 130.6k
+req/s, and xitca-web averaged 134.8k req/s.
 
 Treat these numbers as directional; they vary by machine, thermal state, Zig
 build, and background load.
 
-The next likely performance wins are request/response arena reuse, vectorized or
-lower-copy writes, better request parser state reuse, specialized typed query
-parsers, and a reproducible benchmark suite with regression thresholds.
+The next likely performance wins are worker scheduling/backlog tuning,
+request/response arena reuse, lower-copy writes, better request parser state
+reuse, specialized typed query parsers, and stricter benchmark regression
+thresholds.
 
 ## Build And Bench
 
 ```bash
 zig build test
 zig build -Doptimize=ReleaseFast bench -- 10000000
+zig build -Doptimize=ReleaseFast bench -- 1000000 --warmup 100000 --repeat 5 --format=json
 zig build -Doptimize=ReleaseFast http-server -- 8080
+zig build -Doptimize=ReleaseFast http-server -- 8080 event_loop
+zig build -Doptimize=ReleaseFast http-server -- 8080 event_loop 4
 ```
+
+The dispatch benchmark covers root dispatch, typed path/query dispatch, exact
+static route lookup at 64 routes, direct typed path/query parsing, request
+header/cookie helpers, typed JSON body parsing, and raw turboapi-core lookup.
 
 Example local `wrk` profile:
 
 ```bash
 wrk -t4 -c64 -d10s --latency http://127.0.0.1:8080/
 wrk -t4 -c64 -d10s --latency 'http://127.0.0.1:8080/users/42?verbose=true'
+./scripts/bench-http.sh
+WORKERS=4 ./scripts/bench-http.sh
+./scripts/check-dispatch-bench.sh
 ```
 
 ## Feature Shape

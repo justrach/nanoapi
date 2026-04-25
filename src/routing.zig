@@ -40,6 +40,32 @@ const ExactRoute = struct {
     index: usize,
 };
 
+const ExactRouteKey = struct {
+    method: []const u8,
+    path: []const u8,
+};
+
+const ExactRouteContext = struct {
+    pub fn hash(_: @This(), key: ExactRouteKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(key.method);
+        hasher.update(&.{0});
+        hasher.update(key.path);
+        return hasher.final();
+    }
+
+    pub fn eql(_: @This(), a: ExactRouteKey, b: ExactRouteKey) bool {
+        return std.mem.eql(u8, a.method, b.method) and std.mem.eql(u8, a.path, b.path);
+    }
+};
+
+const ExactRouteMap = std.HashMapUnmanaged(
+    ExactRouteKey,
+    usize,
+    ExactRouteContext,
+    std.hash_map.default_max_load_percentage,
+);
+
 pub const APIRouter = struct {
     allocator: std.mem.Allocator,
     prefix: []const u8,
@@ -47,6 +73,8 @@ pub const APIRouter = struct {
     core_router: core.Router,
     routes_list: std.ArrayList(RouteDefinition) = .empty,
     exact_routes: std.ArrayList(ExactRoute) = .empty,
+    exact_route_map: ExactRouteMap = .empty,
+    exact_method_mask: u8 = 0,
     root_get_index: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, router_options: RouterOptions) !APIRouter {
@@ -64,6 +92,7 @@ pub const APIRouter = struct {
     }
 
     pub fn deinit(self: *APIRouter) void {
+        self.exact_route_map.deinit(self.allocator);
         for (self.routes_list.items) |*route_def| route_def.deinit(self.allocator);
         self.exact_routes.deinit(self.allocator);
         self.routes_list.deinit(self.allocator);
@@ -138,9 +167,10 @@ pub const APIRouter = struct {
             }
         }
 
-        for (self.exact_routes.items) |exact| {
-            if (std.mem.eql(u8, req.method, exact.method) and std.mem.eql(u8, req.path, exact.path)) {
-                return self.routes_list.items[exact.index].handler(req);
+        const exact_method_mask = self.exact_method_mask;
+        if (exact_method_mask != 0 and (exact_method_mask & methodMaskBit(req.method)) != 0) {
+            if (self.exact_route_map.getContext(.{ .method = req.method, .path = req.path }, .{})) |index| {
+                return self.routes_list.items[index].handler(req);
             }
         }
 
@@ -192,25 +222,59 @@ pub const APIRouter = struct {
             .options = owned_options,
         };
 
+        const is_root_get = std.mem.eql(u8, owned_method, "GET") and std.mem.eql(u8, full_path, "/");
+        const is_exact_non_root = !is_root_get and isExactPath(full_path);
+        if (is_exact_non_root) {
+            try self.exact_routes.ensureUnusedCapacity(self.allocator, 1);
+            try self.exact_route_map.ensureUnusedCapacityContext(self.allocator, 1, .{});
+        }
+
         try self.routes_list.append(self.allocator, route_def);
         errdefer _ = self.routes_list.pop();
 
-        if (std.mem.eql(u8, owned_method, "GET") and std.mem.eql(u8, full_path, "/")) {
+        try self.core_router.addRoute(method, full_path, key);
+
+        if (is_root_get) {
             self.root_get_index = index;
-        } else if (isExactPath(full_path)) {
-            try self.exact_routes.append(self.allocator, .{
+        } else if (is_exact_non_root) {
+            const exact_key = ExactRouteKey{ .method = owned_method, .path = full_path };
+            self.exact_routes.appendAssumeCapacity(.{
                 .method = owned_method,
                 .path = full_path,
                 .index = index,
             });
+            const gop = self.exact_route_map.getOrPutAssumeCapacityContext(exact_key, .{});
+            if (!gop.found_existing) {
+                gop.value_ptr.* = index;
+            }
+            self.exact_method_mask |= methodMaskBit(owned_method);
         }
-
-        try self.core_router.addRoute(method, full_path, key);
     }
 };
 
 fn isExactPath(path: []const u8) bool {
     return std.mem.indexOfAny(u8, path, "{*") == null;
+}
+
+fn methodMaskBit(method: []const u8) u8 {
+    return @as(u8, 1) << methodSlot(method);
+}
+
+fn methodSlot(method: []const u8) u3 {
+    if (method.len < 3) return 7;
+    return switch (method[0]) {
+        'G' => if (method.len == 3 and method[1] == 'E' and method[2] == 'T') 0 else 7,
+        'P' => switch (method.len) {
+            3 => if (method[1] == 'U' and method[2] == 'T') 2 else 7,
+            4 => if (method[1] == 'O' and method[2] == 'S' and method[3] == 'T') 1 else 7,
+            5 => if (method[1] == 'A' and method[2] == 'T' and method[3] == 'C' and method[4] == 'H') 4 else 7,
+            else => 7,
+        },
+        'D' => if (method.len == 6 and std.mem.eql(u8, method, "DELETE")) 3 else 7,
+        'H' => if (method.len == 4 and std.mem.eql(u8, method, "HEAD")) 5 else 7,
+        'O' => if (method.len == 7 and std.mem.eql(u8, method, "OPTIONS")) 6 else 7,
+        else => 7,
+    };
 }
 
 fn routeKeyForIndex(allocator: std.mem.Allocator, index: usize) ![]u8 {
@@ -384,4 +448,31 @@ fn joinPath(allocator: std.mem.Allocator, prefix: []const u8, path: []const u8) 
         return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ prefix, path });
     }
     return try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, path });
+}
+
+fn propfindHandler(req: *request.Request) anyerror!response.Response {
+    return response.Response.fromStaticBody(req.allocator, "propfind", .{ .media_type = "text/plain" });
+}
+
+fn reportHandler(req: *request.Request) anyerror!response.Response {
+    return response.Response.fromStaticBody(req.allocator, "report", .{ .media_type = "text/plain" });
+}
+
+test "APIRouter exact static dispatch keeps custom methods distinct" {
+    const allocator = std.testing.allocator;
+    var router = try APIRouter.init(allocator, .{});
+    defer router.deinit();
+
+    try router.route("PROPFIND", "/resource", propfindHandler, .{});
+    try router.route("REPORT", "/resource", reportHandler, .{});
+
+    var propfind_req = request.Request.init(allocator, "PROPFIND", "/resource", &.{}, "");
+    var propfind_res = try router.handle(&propfind_req);
+    defer propfind_res.deinit();
+    try std.testing.expectEqualStrings("propfind", propfind_res.body);
+
+    var report_req = request.Request.init(allocator, "REPORT", "/resource", &.{}, "");
+    var report_res = try router.handle(&report_req);
+    defer report_res.deinit();
+    try std.testing.expectEqualStrings("report", report_res.body);
 }

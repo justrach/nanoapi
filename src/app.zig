@@ -102,6 +102,18 @@ pub const App = struct {
         try typed.get(self, PathParams, QueryParams, path, handler, route_options);
     }
 
+    pub fn postTypedBody(
+        self: *App,
+        comptime PathParams: type,
+        comptime QueryParams: type,
+        comptime BodyModel: type,
+        path: []const u8,
+        comptime handler: typed.HandlerWithBody(PathParams, QueryParams, BodyModel),
+        route_options: meta.RouteOptions,
+    ) !void {
+        try typed.postWithBody(self, PathParams, QueryParams, BodyModel, path, handler, route_options);
+    }
+
     pub fn post(self: *App, path: []const u8, handler: routing.Handler, route_options: meta.RouteOptions) !void {
         try self.router.post(path, handler, route_options);
     }

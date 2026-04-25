@@ -249,6 +249,42 @@ test "typed routes return DHI-backed validation errors" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "ValidationFailed") != null);
 }
 
+test "typed routes parse and validate JSON bodies" {
+    const allocator = std.testing.allocator;
+    var api = try NanoAPI.init(allocator, .{});
+    defer api.deinit();
+
+    const BodyModel = struct {
+        user_id: i64,
+        active: bool,
+    };
+    const Handler = struct {
+        fn postUser(ctx: typed.ContextWithBody(typed.Empty, typed.Empty, BodyModel)) anyerror!Response {
+            const body = try std.fmt.allocPrint(
+                ctx.raw.allocator,
+                "{{\"user_id\":{d},\"active\":{s}}}",
+                .{ ctx.body.user_id, if (ctx.body.active) "true" else "false" },
+            );
+            return response.Response.fromOwnedBody(ctx.raw.allocator, body, .{ .media_type = "application/json" });
+        }
+    };
+
+    try api.postTypedBody(typed.Empty, typed.Empty, BodyModel, "/typed-body", Handler.postUser, .{});
+
+    var req = Request.init(allocator, "POST", "/typed-body", &.{}, "{\"user_id\":42,\"active\":true}");
+    var resp = try api.handle(&req);
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, status.HTTP_200_OK), resp.status_code);
+    try std.testing.expectEqualStrings("{\"user_id\":42,\"active\":true}", resp.body);
+
+    var bad_req = Request.init(allocator, "POST", "/typed-body", &.{}, "{\"user_id\":\"bad\",\"active\":true}");
+    var bad_resp = try api.handle(&bad_req);
+    defer bad_resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, status.HTTP_422_UNPROCESSABLE_ENTITY), bad_resp.status_code);
+}
+
 test {
     _ = core;
     _ = app;

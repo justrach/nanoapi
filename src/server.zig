@@ -18,6 +18,8 @@ pub const Options = struct {
     read_buffer_size: usize = 16 * 1024,
     max_headers: usize = 64,
     runtime: Runtime = .auto,
+    /// Number of event-loop workers. 0 means one worker per logical CPU.
+    worker_threads: usize = 0,
 };
 
 pub const Runtime = enum {
@@ -67,7 +69,7 @@ pub const Server = struct {
     }
 
     fn listenAndServeThreaded(self: *Server) !void {
-        self.listen_fd = try createListenSocket(self.options);
+        self.listen_fd = try createListenSocket(self.options, false);
 
         while (true) {
             const fd = c.accept(self.listen_fd, null, null);
@@ -88,8 +90,26 @@ pub const Server = struct {
     }
 
     fn listenAndServeEventLoop(self: *Server) !void {
-        self.listen_fd = try createListenSocket(self.options);
+        const worker_count = effectiveWorkerCount(self.options.worker_threads);
+        if (worker_count > 1) return self.listenAndServeEventLoopWorkers(worker_count);
 
+        self.listen_fd = try createListenSocket(self.options, false);
+        return self.runEventLoop(self.listen_fd);
+    }
+
+    fn listenAndServeEventLoopWorkers(self: *Server, worker_count: usize) !void {
+        var worker_index: usize = 1;
+        while (worker_index < worker_count) : (worker_index += 1) {
+            const thread = try std.Thread.spawn(.{}, eventLoopWorker, .{ self, worker_index });
+            thread.detach();
+        }
+
+        const listen_fd = try createListenSocket(self.options, true);
+        defer _ = close(listen_fd);
+        try self.runEventLoop(listen_fd);
+    }
+
+    fn runEventLoop(self: *Server, listen_fd: c.fd_t) !void {
         const kq = c.kqueue();
         switch (c.errno(kq)) {
             .SUCCESS => {},
@@ -97,7 +117,7 @@ pub const Server = struct {
         }
         defer _ = close(kq);
 
-        try registerRead(kq, self.listen_fd, 0);
+        try registerRead(kq, listen_fd, 0);
 
         var connections = std.AutoHashMap(c.fd_t, *Connection).init(self.allocator);
         defer {
@@ -116,8 +136,8 @@ pub const Server = struct {
             }
 
             for (events[0..@intCast(n)]) |ev| {
-                if (ev.ident == @as(usize, @intCast(self.listen_fd))) {
-                    const fd = c.accept(self.listen_fd, null, null);
+                if (ev.ident == @as(usize, @intCast(listen_fd))) {
+                    const fd = c.accept(listen_fd, null, null);
                     switch (c.errno(fd)) {
                         .SUCCESS => {},
                         .INTR, .AGAIN => continue,
@@ -157,6 +177,27 @@ pub const Server = struct {
     }
 };
 
+fn eventLoopWorker(server: *Server, worker_index: usize) void {
+    const listen_fd = createListenSocket(server.options, true) catch |err| {
+        if (builtin.mode == .Debug) {
+            std.debug.print("event-loop worker {d} failed to listen: {t}\n", .{ worker_index, err });
+        }
+        return;
+    };
+    defer _ = close(listen_fd);
+
+    server.runEventLoop(listen_fd) catch |err| {
+        if (builtin.mode == .Debug) {
+            std.debug.print("event-loop worker {d} stopped: {t}\n", .{ worker_index, err });
+        }
+    };
+}
+
+fn effectiveWorkerCount(configured: usize) usize {
+    if (configured != 0) return @max(configured, 1);
+    return @max(std.Thread.getCpuCount() catch 1, 1);
+}
+
 pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, options: Options) !void {
     var server = Server.init(app, allocator, options);
     defer server.deinit();
@@ -166,19 +207,26 @@ pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, options: Options) 
 fn handleConnection(server: *Server, fd: c.fd_t) void {
     defer _ = close(fd);
 
-    const buf = server.allocator.alloc(u8, server.options.read_buffer_size) catch return;
-    defer server.allocator.free(buf);
+    var input = InputBuffer{
+        .buf = server.allocator.alloc(u8, server.options.read_buffer_size) catch return,
+    };
+    defer server.allocator.free(input.buf);
 
     const headers = server.allocator.alloc(request.HeaderPair, server.options.max_headers) catch return;
     defer server.allocator.free(headers);
 
-    while (true) {
-        const n = recvOnce(fd, buf) catch return;
-        if (n == 0) return;
+    if ((input.readAppend(fd) catch return) == false) return;
 
-        const parsed = parseRequestHead(buf[0..n], headers) catch {
-            sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
-            return;
+    while (true) {
+        const parsed = parseRequestHead(input.bytes(), headers) catch |err| switch (err) {
+            error.IncompleteRequestHead => {
+                if ((input.readAppend(fd) catch return) == false) return;
+                continue;
+            },
+            else => {
+                sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+                return;
+            },
         };
         const body = readFullBody(server.allocator, fd, parsed) catch {
             sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
@@ -186,7 +234,7 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
         };
         defer body.deinit(server.allocator);
 
-        var req = request.Request.initParts(
+        var req = request.Request.initPartsCached(
             server.allocator,
             parsed.method,
             parsed.target,
@@ -194,6 +242,7 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
             parsed.query_string,
             parsed.headers,
             body.bytes,
+            parsed.header_cache,
         );
 
         var res = server.app.handle(&req) catch {
@@ -204,13 +253,15 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
 
         sendResponse(fd, &res, parsed.keep_alive, parsed.send_keep_alive_header, std.mem.eql(u8, parsed.method, "HEAD")) catch return;
         if (!parsed.keep_alive) return;
+        input.consume(parsed.consumed_len);
+        if (input.len == 0 and (input.readAppend(fd) catch return) == false) return;
     }
 }
 
 const Connection = struct {
     server: *Server,
     fd: c.fd_t,
-    buf: []u8,
+    input: InputBuffer,
     headers: []request.HeaderPair,
 
     fn create(server: *Server, fd: c.fd_t) !*Connection {
@@ -226,7 +277,7 @@ const Connection = struct {
         conn.* = .{
             .server = server,
             .fd = fd,
-            .buf = buf,
+            .input = .{ .buf = buf },
             .headers = headers,
         };
         return conn;
@@ -235,42 +286,81 @@ const Connection = struct {
     fn deinit(self: *Connection) void {
         _ = close(self.fd);
         self.server.allocator.free(self.headers);
-        self.server.allocator.free(self.buf);
+        self.server.allocator.free(self.input.buf);
         self.server.allocator.destroy(self);
     }
 
     fn handleReadable(self: *Connection) bool {
-        const n = recvOnce(self.fd, self.buf) catch return false;
+        if ((self.input.readAppend(self.fd) catch return false) == false) return false;
+
+        while (self.input.len > 0) {
+            const parsed = parseRequestHead(self.input.bytes(), self.headers) catch |err| switch (err) {
+                error.IncompleteRequestHead => return true,
+                else => {
+                    sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+                    return false;
+                },
+            };
+
+            if (parsed.body.len < parsed.content_length and parsed.body_start + parsed.content_length <= self.input.buf.len) {
+                return true;
+            }
+
+            const body = readFullBody(self.server.allocator, self.fd, parsed) catch {
+                sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+                return false;
+            };
+            defer body.deinit(self.server.allocator);
+
+            var req = request.Request.initPartsCached(
+                self.server.allocator,
+                parsed.method,
+                parsed.target,
+                parsed.path,
+                parsed.query_string,
+                parsed.headers,
+                body.bytes,
+                parsed.header_cache,
+            );
+
+            var res = self.server.app.handle(&req) catch {
+                sendError(self.fd, status.HTTP_500_INTERNAL_SERVER_ERROR, "Internal Server Error") catch {};
+                return false;
+            };
+            defer res.deinit();
+
+            sendResponse(self.fd, &res, parsed.keep_alive, parsed.send_keep_alive_header, std.mem.eql(u8, parsed.method, "HEAD")) catch return false;
+            if (!parsed.keep_alive) return false;
+            self.input.consume(parsed.consumed_len);
+        }
+        return true;
+    }
+};
+
+const InputBuffer = struct {
+    buf: []u8,
+    len: usize = 0,
+
+    fn bytes(self: *const InputBuffer) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    fn readAppend(self: *InputBuffer, fd: c.fd_t) !bool {
+        if (self.len == self.buf.len) return error.RequestBufferFull;
+        const n = try recvOnce(fd, self.buf[self.len..]);
         if (n == 0) return false;
+        self.len += n;
+        return true;
+    }
 
-        const parsed = parseRequestHead(self.buf[0..n], self.headers) catch {
-            sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
-            return false;
-        };
-        const body = readFullBody(self.server.allocator, self.fd, parsed) catch {
-            sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
-            return false;
-        };
-        defer body.deinit(self.server.allocator);
-
-        var req = request.Request.initParts(
-            self.server.allocator,
-            parsed.method,
-            parsed.target,
-            parsed.path,
-            parsed.query_string,
-            parsed.headers,
-            body.bytes,
-        );
-
-        var res = self.server.app.handle(&req) catch {
-            sendError(self.fd, status.HTTP_500_INTERNAL_SERVER_ERROR, "Internal Server Error") catch {};
-            return false;
-        };
-        defer res.deinit();
-
-        sendResponse(self.fd, &res, parsed.keep_alive, parsed.send_keep_alive_header, std.mem.eql(u8, parsed.method, "HEAD")) catch return false;
-        return parsed.keep_alive;
+    fn consume(self: *InputBuffer, amount: usize) void {
+        if (amount >= self.len) {
+            self.len = 0;
+            return;
+        }
+        const remaining = self.len - amount;
+        std.mem.copyForwards(u8, self.buf[0..remaining], self.buf[amount..self.len]);
+        self.len = remaining;
     }
 };
 
@@ -280,7 +370,10 @@ const ParsedRequest = struct {
     path: []const u8,
     query_string: []const u8,
     headers: []const request.HeaderPair,
+    header_cache: request.Request.HeaderCache,
     body: []const u8,
+    body_start: usize,
+    consumed_len: usize,
     content_length: usize,
     keep_alive: bool,
     send_keep_alive_header: bool,
@@ -303,14 +396,17 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
     var keep_alive = std.mem.eql(u8, version, "HTTP/1.1");
     var send_keep_alive_header = false;
     var header_count: usize = 0;
+    var header_cache = request.Request.HeaderCache.initForBuffer(headers_buf);
     var content_length: usize = 0;
     var pos = first_line_end + 2;
+    var body_start: usize = 0;
     var body: []const u8 = "";
 
     while (true) {
         if (pos + 1 >= buf.len) return error.IncompleteRequestHead;
         if (buf[pos] == '\r' and buf[pos + 1] == '\n') {
-            body = buf[pos + 2 ..];
+            body_start = pos + 2;
+            body = buf[body_start..];
             break;
         }
         if (header_count >= headers_buf.len) return error.TooManyHeaders;
@@ -335,6 +431,7 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
         const value = trimHeaderWhitespace(buf[colon_pos + 1 .. line_end]);
 
         headers_buf[header_count] = .{ .name = name, .value = value };
+        header_cache.observe(name, header_count);
         header_count += 1;
 
         if (std.ascii.eqlIgnoreCase(name, "connection")) {
@@ -348,13 +445,21 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
         }
     }
 
+    const headers = headers_buf[0..header_count];
+    header_cache.finish(headers);
+    const body_len = @min(body.len, content_length);
+    const consumed_len = if (body.len >= content_length) body_start + content_length else buf.len;
+
     return .{
         .method = method,
         .target = target,
         .path = path,
         .query_string = query_string,
-        .headers = headers_buf[0..header_count],
-        .body = if (body.len > content_length) body[0..content_length] else body,
+        .headers = headers,
+        .header_cache = header_cache,
+        .body = body[0..body_len],
+        .body_start = body_start,
+        .consumed_len = consumed_len,
         .content_length = content_length,
         .keep_alive = keep_alive,
         .send_keep_alive_header = send_keep_alive_header,
@@ -402,7 +507,7 @@ fn readFullBody(
     return .{ .bytes = body, .owned = true };
 }
 
-fn createListenSocket(options: Options) !c.fd_t {
+fn createListenSocket(options: Options, reuse_port: bool) !c.fd_t {
     const fd = socket(c.AF.INET, c.SOCK.STREAM, 0);
     switch (c.errno(fd)) {
         .SUCCESS => {},
@@ -418,6 +523,16 @@ fn createListenSocket(options: Options) !c.fd_t {
         &reuse,
         @sizeOf(@TypeOf(reuse)),
     );
+
+    if (reuse_port and @hasDecl(c.SO, "REUSEPORT")) {
+        _ = c.setsockopt(
+            fd,
+            c.SOL.SOCKET,
+            c.SO.REUSEPORT,
+            &reuse,
+            @sizeOf(@TypeOf(reuse)),
+        );
+    }
 
     if (@hasDecl(c.SO, "NOSIGPIPE")) {
         var no_sigpipe: c_int = 1;
@@ -475,6 +590,16 @@ fn configureAcceptedSocket(fd: c.fd_t) void {
             fd,
             c.SOL.SOCKET,
             c.SO.NOSIGPIPE,
+            &enabled,
+            @sizeOf(@TypeOf(enabled)),
+        );
+    }
+
+    if (@hasDecl(c, "TCP") and @hasDecl(c.TCP, "NODELAY") and @hasDecl(c, "IPPROTO") and @hasDecl(c.IPPROTO, "TCP")) {
+        _ = c.setsockopt(
+            fd,
+            c.IPPROTO.TCP,
+            c.TCP.NODELAY,
             &enabled,
             @sizeOf(@TypeOf(enabled)),
         );
@@ -582,6 +707,23 @@ fn canUseFastJsonBytes(res: *const response.Response, keep_alive: bool, send_kee
 }
 
 fn sendFastJsonBytes(fd: c.fd_t, body: []const u8) !void {
+    if (comptime @hasDecl(c.SO, "NOSIGPIPE")) {
+        return sendFastJsonBytesVectored(fd, body);
+    }
+    return sendFastJsonBytesBuffered(fd, body);
+}
+
+fn sendFastJsonBytesVectored(fd: c.fd_t, body: []const u8) !void {
+    var len_buf: [20]u8 = undefined;
+    const len_bytes = len_buf[0..appendDecimal(&len_buf, body.len)];
+
+    const prefix = "HTTP/1.1 200 OK\r\nContent-Length: ";
+    const middle = "\r\nContent-Type: application/json\r\n\r\n";
+    const parts = [_][]const u8{ prefix, len_bytes, middle, body };
+    try sendAllParts(fd, &parts);
+}
+
+fn sendFastJsonBytesBuffered(fd: c.fd_t, body: []const u8) !void {
     var buf: [1024]u8 = undefined;
     var len: usize = 0;
 
@@ -609,6 +751,55 @@ fn sendFastJsonBytes(fd: c.fd_t, body: []const u8) !void {
     try sendAll(fd, buf[0..len]);
 }
 
+fn sendAllParts(fd: c.fd_t, parts: []const []const u8) !void {
+    var iovecs: [8]posix.iovec_const = undefined;
+    var iov_count: usize = 0;
+    for (parts) |part| {
+        if (part.len == 0) continue;
+        iovecs[iov_count] = .{ .base = part.ptr, .len = part.len };
+        iov_count += 1;
+    }
+    if (iov_count == 0) return;
+
+    var index: usize = 0;
+    var offset: usize = 0;
+    while (index < iov_count) {
+        var active: [8]posix.iovec_const = undefined;
+        active[0] = .{
+            .base = iovecs[index].base + offset,
+            .len = iovecs[index].len - offset,
+        };
+        var active_count: usize = 1;
+        var src = index + 1;
+        while (src < iov_count) : (src += 1) {
+            active[active_count] = iovecs[src];
+            active_count += 1;
+        }
+
+        const n = c.writev(fd, &active, @intCast(active_count));
+        switch (c.errno(n)) {
+            .SUCCESS => {
+                if (n == 0) return error.ConnectionClosed;
+                var advanced: usize = @intCast(n);
+                while (advanced > 0) {
+                    const remaining = iovecs[index].len - offset;
+                    if (advanced < remaining) {
+                        offset += advanced;
+                        break;
+                    }
+                    advanced -= remaining;
+                    index += 1;
+                    offset = 0;
+                    if (index == iov_count) break;
+                }
+            },
+            .INTR => continue,
+            .AGAIN => continue,
+            else => |err| return errnoError(err),
+        }
+    }
+}
+
 fn appendDecimal(out: []u8, value: usize) usize {
     if (value == 0) {
         out[0] = '0';
@@ -633,6 +824,61 @@ fn sendFileBody(fd: c.fd_t, path: []const u8, file_size: u64) !void {
     const file_fd = try posix.openat(c.AT.FDCWD, path, .{}, 0);
     defer _ = close(file_fd);
 
+    if (comptime hasSendfile()) {
+        return sendFileBodyZeroCopy(fd, file_fd, file_size) catch |err| switch (err) {
+            error.Unexpected => sendFileBodyBuffered(fd, file_fd, file_size),
+            else => err,
+        };
+    }
+    return sendFileBodyBuffered(fd, file_fd, file_size);
+}
+
+fn hasSendfile() bool {
+    return switch (builtin.os.tag) {
+        .driverkit, .ios, .linux, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
+        else => false,
+    };
+}
+
+fn sendFileBodyZeroCopy(socket_fd: c.fd_t, file_fd: c.fd_t, file_size: u64) !void {
+    switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
+            var offset: c.off_t = 0;
+            var remaining = std.math.cast(c.off_t, file_size) orelse return error.Unexpected;
+            while (remaining > 0) {
+                var sent = remaining;
+                const rc = c.sendfile(file_fd, socket_fd, offset, &sent, null, 0);
+                if (sent > 0) {
+                    offset += sent;
+                    remaining -= sent;
+                }
+                switch (c.errno(rc)) {
+                    .SUCCESS => {},
+                    .INTR, .AGAIN => continue,
+                    else => |err| return errnoError(err),
+                }
+            }
+        },
+        .linux => {
+            var offset: c.off_t = 0;
+            var remaining = std.math.cast(usize, file_size) orelse return error.Unexpected;
+            while (remaining > 0) {
+                const n = c.sendfile(socket_fd, file_fd, &offset, remaining);
+                switch (c.errno(n)) {
+                    .SUCCESS => {
+                        if (n == 0) return error.ConnectionClosed;
+                        remaining -= @intCast(n);
+                    },
+                    .INTR, .AGAIN => continue,
+                    else => |err| return errnoError(err),
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn sendFileBodyBuffered(fd: c.fd_t, file_fd: c.fd_t, file_size: u64) !void {
     var buf: [16 * 1024]u8 = undefined;
     var remaining = file_size;
     while (remaining > 0) {
@@ -653,9 +899,8 @@ fn chunkedWrite(sink: *anyopaque, bytes: []const u8) !void {
     const chunked: *ChunkedSink = @ptrCast(@alignCast(sink));
     var header: [32]u8 = undefined;
     const header_bytes = try std.fmt.bufPrint(&header, "{x}\r\n", .{bytes.len});
-    try sendAll(chunked.fd, header_bytes);
-    try sendAll(chunked.fd, bytes);
-    try sendAll(chunked.fd, "\r\n");
+    const parts = [_][]const u8{ header_bytes, bytes, "\r\n" };
+    try sendAllParts(chunked.fd, &parts);
 }
 
 fn chunkedFlush(sink: *anyopaque) !void {
@@ -773,4 +1018,26 @@ test "parse HTTP request content length" {
     try std.testing.expectEqualStrings("POST", parsed.method);
     try std.testing.expectEqual(@as(usize, 5), parsed.content_length);
     try std.testing.expectEqualStrings("hello", parsed.body);
+}
+
+test "parse HTTP request preserves pipelined bytes after body" {
+    var headers: [8]request.HeaderPair = undefined;
+    const bytes =
+        "POST /upload HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello" ++
+        "GET /next HTTP/1.1\r\n\r\n";
+    const parsed = try parseRequestHead(bytes, &headers);
+
+    try std.testing.expectEqual(@as(usize, 5), parsed.content_length);
+    try std.testing.expectEqualStrings("hello", parsed.body);
+    try std.testing.expectEqualStrings("GET /next HTTP/1.1\r\n\r\n", bytes[parsed.consumed_len..]);
+}
+
+test "parse HTTP request consumes zero-body request before pipeline" {
+    var headers: [8]request.HeaderPair = undefined;
+    const bytes = "GET / HTTP/1.1\r\n\r\nGET /next HTTP/1.1\r\n\r\n";
+    const parsed = try parseRequestHead(bytes, &headers);
+
+    try std.testing.expectEqual(@as(usize, 0), parsed.content_length);
+    try std.testing.expectEqual(@as(usize, 0), parsed.body.len);
+    try std.testing.expectEqualStrings("GET /next HTTP/1.1\r\n\r\n", bytes[parsed.consumed_len..]);
 }
