@@ -67,6 +67,10 @@ result="${OUT_DIR}/http-${stamp}.txt"
 
   echo "## GET /events"
   wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" --latency "http://127.0.0.1:${PORT}/events"
+  echo
+
+  echo "## GET /file"
+  wrk -t"$THREADS" -c"$CONNECTIONS" -d"$DURATION" --latency "http://127.0.0.1:${PORT}/file"
 } | tee "$result"
 
 echo "wrote ${result}"

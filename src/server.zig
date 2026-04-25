@@ -773,6 +773,61 @@ fn sendFileBody(fd: c.fd_t, path: []const u8, file_size: u64) !void {
     const file_fd = try posix.openat(c.AT.FDCWD, path, .{}, 0);
     defer _ = close(file_fd);
 
+    if (comptime hasSendfile()) {
+        return sendFileBodyZeroCopy(fd, file_fd, file_size) catch |err| switch (err) {
+            error.Unexpected => sendFileBodyBuffered(fd, file_fd, file_size),
+            else => err,
+        };
+    }
+    return sendFileBodyBuffered(fd, file_fd, file_size);
+}
+
+fn hasSendfile() bool {
+    return switch (builtin.os.tag) {
+        .driverkit, .ios, .linux, .maccatalyst, .macos, .tvos, .visionos, .watchos => true,
+        else => false,
+    };
+}
+
+fn sendFileBodyZeroCopy(socket_fd: c.fd_t, file_fd: c.fd_t, file_size: u64) !void {
+    switch (builtin.os.tag) {
+        .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
+            var offset: c.off_t = 0;
+            var remaining = std.math.cast(c.off_t, file_size) orelse return error.Unexpected;
+            while (remaining > 0) {
+                var sent = remaining;
+                const rc = c.sendfile(file_fd, socket_fd, offset, &sent, null, 0);
+                if (sent > 0) {
+                    offset += sent;
+                    remaining -= sent;
+                }
+                switch (c.errno(rc)) {
+                    .SUCCESS => {},
+                    .INTR, .AGAIN => continue,
+                    else => |err| return errnoError(err),
+                }
+            }
+        },
+        .linux => {
+            var offset: c.off_t = 0;
+            var remaining = std.math.cast(usize, file_size) orelse return error.Unexpected;
+            while (remaining > 0) {
+                const n = c.sendfile(socket_fd, file_fd, &offset, remaining);
+                switch (c.errno(n)) {
+                    .SUCCESS => {
+                        if (n == 0) return error.ConnectionClosed;
+                        remaining -= @intCast(n);
+                    },
+                    .INTR, .AGAIN => continue,
+                    else => |err| return errnoError(err),
+                }
+            }
+        },
+        else => unreachable,
+    }
+}
+
+fn sendFileBodyBuffered(fd: c.fd_t, file_fd: c.fd_t, file_size: u64) !void {
     var buf: [16 * 1024]u8 = undefined;
     var remaining = file_size;
     while (remaining > 0) {

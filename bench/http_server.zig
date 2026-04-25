@@ -46,6 +46,10 @@ fn eventStream(req: *nano.Request) anyerror!nano.Response {
     return nano.EventSourceResponse.init(req.allocator, events, .{});
 }
 
+fn file(req: *nano.Request) anyerror!nano.Response {
+    return nano.FileResponse.init(req.allocator, "README.md", null, .{});
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.smp_allocator;
     const config = try configFromArgs(init.minimal.args);
@@ -57,6 +61,7 @@ pub fn main(init: std.process.Init) !void {
     try app.getTyped(PathParams, QueryParams, "/users/{user_id}", user, .{});
     try app.get("/auth", auth, .{});
     try app.get("/events", eventStream, .{});
+    try app.get("/file", file, .{});
 
     if (config.check_only) return;
 
