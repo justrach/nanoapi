@@ -34,12 +34,20 @@ pub const RouteDefinition = struct {
     }
 };
 
+const ExactRoute = struct {
+    method: []const u8,
+    path: []const u8,
+    index: usize,
+};
+
 pub const APIRouter = struct {
     allocator: std.mem.Allocator,
     prefix: []const u8,
     tags: []const []const u8,
     core_router: core.Router,
     routes_list: std.ArrayList(RouteDefinition) = .empty,
+    exact_routes: std.ArrayList(ExactRoute) = .empty,
+    root_get_index: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, router_options: RouterOptions) !APIRouter {
         const prefix = try allocator.dupe(u8, router_options.prefix);
@@ -57,6 +65,7 @@ pub const APIRouter = struct {
 
     pub fn deinit(self: *APIRouter) void {
         for (self.routes_list.items) |*route_def| route_def.deinit(self.allocator);
+        self.exact_routes.deinit(self.allocator);
         self.routes_list.deinit(self.allocator);
         self.core_router.deinit();
         freeStringList(self.allocator, self.tags);
@@ -123,6 +132,18 @@ pub const APIRouter = struct {
     }
 
     pub fn handle(self: *APIRouter, req: *request.Request) !response.Response {
+        if (self.root_get_index) |index| {
+            if (req.path.len == 1 and req.path[0] == '/' and std.mem.eql(u8, req.method, "GET")) {
+                return self.routes_list.items[index].handler(req);
+            }
+        }
+
+        for (self.exact_routes.items) |exact| {
+            if (std.mem.eql(u8, req.method, exact.method) and std.mem.eql(u8, req.path, exact.path)) {
+                return self.routes_list.items[exact.index].handler(req);
+            }
+        }
+
         var matched = self.core_router.findRoute(req.method, req.path) orelse {
             return response.jsonError(req.allocator, status.HTTP_404_NOT_FOUND, "Not Found", &.{});
         };
@@ -174,9 +195,23 @@ pub const APIRouter = struct {
         try self.routes_list.append(self.allocator, route_def);
         errdefer _ = self.routes_list.pop();
 
+        if (std.mem.eql(u8, owned_method, "GET") and std.mem.eql(u8, full_path, "/")) {
+            self.root_get_index = index;
+        } else if (isExactPath(full_path)) {
+            try self.exact_routes.append(self.allocator, .{
+                .method = owned_method,
+                .path = full_path,
+                .index = index,
+            });
+        }
+
         try self.core_router.addRoute(method, full_path, key);
     }
 };
+
+fn isExactPath(path: []const u8) bool {
+    return std.mem.indexOfAny(u8, path, "{*") == null;
+}
 
 fn routeKeyForIndex(allocator: std.mem.Allocator, index: usize) ![]u8 {
     const key = try allocator.alloc(u8, @sizeOf(usize));

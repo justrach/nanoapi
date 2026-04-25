@@ -17,7 +17,7 @@ pub const Options = struct {
     backlog: c_uint = 1024,
     read_buffer_size: usize = 16 * 1024,
     max_headers: usize = 64,
-    runtime: Runtime = .thread_per_connection,
+    runtime: Runtime = .auto,
 };
 
 pub const Runtime = enum {
@@ -202,7 +202,7 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
         };
         defer res.deinit();
 
-        sendResponse(fd, &res, parsed.keep_alive, std.mem.eql(u8, parsed.method, "HEAD")) catch return;
+        sendResponse(fd, &res, parsed.keep_alive, parsed.send_keep_alive_header, std.mem.eql(u8, parsed.method, "HEAD")) catch return;
         if (!parsed.keep_alive) return;
     }
 }
@@ -269,7 +269,7 @@ const Connection = struct {
         };
         defer res.deinit();
 
-        sendResponse(self.fd, &res, parsed.keep_alive, std.mem.eql(u8, parsed.method, "HEAD")) catch return false;
+        sendResponse(self.fd, &res, parsed.keep_alive, parsed.send_keep_alive_header, std.mem.eql(u8, parsed.method, "HEAD")) catch return false;
         return parsed.keep_alive;
     }
 };
@@ -283,45 +283,66 @@ const ParsedRequest = struct {
     body: []const u8,
     content_length: usize,
     keep_alive: bool,
+    send_keep_alive_header: bool,
 };
 
 pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !ParsedRequest {
-    const header_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.IncompleteRequestHead;
-    const head = buf[0..header_end];
-    const body = buf[header_end + 4 ..];
+    const method_end = std.mem.indexOfScalar(u8, buf, ' ') orelse return error.IncompleteRequestHead;
+    const target_start = method_end + 1;
+    const target_end = std.mem.indexOfScalarPos(u8, buf, target_start, ' ') orelse return error.InvalidRequestLine;
+    const version_start = target_end + 1;
+    const first_line_end = std.mem.indexOfPos(u8, buf, version_start, "\r\n") orelse return error.IncompleteRequestHead;
 
-    const first_line_end = std.mem.indexOf(u8, head, "\r\n") orelse return error.InvalidRequestLine;
-    const first_line = head[0..first_line_end];
-    const method_end = std.mem.indexOfScalar(u8, first_line, ' ') orelse return error.InvalidRequestLine;
-    const version_start = std.mem.lastIndexOfScalar(u8, first_line, ' ') orelse return error.InvalidRequestLine;
-    if (version_start <= method_end) return error.InvalidRequestLine;
-
-    const method = first_line[0..method_end];
-    const target = first_line[method_end + 1 .. version_start];
-    const version = first_line[version_start + 1 ..];
+    const method = buf[0..method_end];
+    const target = buf[target_start..target_end];
+    const version = buf[version_start..first_line_end];
     const query_start = std.mem.indexOfScalar(u8, target, '?');
     const path = if (query_start) |idx| target[0..idx] else target;
     const query_string = if (query_start) |idx| target[idx + 1 ..] else "";
 
     var keep_alive = std.mem.eql(u8, version, "HTTP/1.1");
+    var send_keep_alive_header = false;
     var header_count: usize = 0;
     var content_length: usize = 0;
+    var pos = first_line_end + 2;
+    var body: []const u8 = "";
 
-    var lines = std.mem.splitSequence(u8, head[first_line_end + 2 ..], "\r\n");
-    while (lines.next()) |line| {
-        if (line.len == 0) break;
+    while (true) {
+        if (pos + 1 >= buf.len) return error.IncompleteRequestHead;
+        if (buf[pos] == '\r' and buf[pos + 1] == '\n') {
+            body = buf[pos + 2 ..];
+            break;
+        }
         if (header_count >= headers_buf.len) return error.TooManyHeaders;
 
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.InvalidHeader;
-        const name = std.mem.trim(u8, line[0..colon], " \t");
-        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        const line_start = pos;
+        var colon: ?usize = null;
+        while (true) : (pos += 1) {
+            if (pos + 1 >= buf.len) return error.IncompleteRequestHead;
+            if (buf[pos] == ':' and colon == null) colon = pos;
+            if (buf[pos] == '\r') {
+                if (buf[pos + 1] != '\n') return error.InvalidHeader;
+                break;
+            }
+        }
+
+        const line_end = pos;
+        pos += 2;
+        const colon_pos = colon orelse return error.InvalidHeader;
+        if (colon_pos >= line_end) return error.InvalidHeader;
+
+        const name = trimHeaderWhitespace(buf[line_start..colon_pos]);
+        const value = trimHeaderWhitespace(buf[colon_pos + 1 .. line_end]);
 
         headers_buf[header_count] = .{ .name = name, .value = value };
         header_count += 1;
 
         if (std.ascii.eqlIgnoreCase(name, "connection")) {
             if (std.ascii.eqlIgnoreCase(value, "close")) keep_alive = false;
-            if (std.ascii.eqlIgnoreCase(value, "keep-alive")) keep_alive = true;
+            if (std.ascii.eqlIgnoreCase(value, "keep-alive")) {
+                keep_alive = true;
+                send_keep_alive_header = !std.mem.eql(u8, version, "HTTP/1.1");
+            }
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             content_length = std.fmt.parseInt(usize, value, 10) catch return error.InvalidHeader;
         }
@@ -336,7 +357,16 @@ pub fn parseRequestHead(buf: []const u8, headers_buf: []request.HeaderPair) !Par
         .body = if (body.len > content_length) body[0..content_length] else body,
         .content_length = content_length,
         .keep_alive = keep_alive,
+        .send_keep_alive_header = send_keep_alive_header,
     };
+}
+
+fn trimHeaderWhitespace(value: []const u8) []const u8 {
+    var start: usize = 0;
+    var end = value.len;
+    while (start < end and (value[start] == ' ' or value[start] == '\t')) : (start += 1) {}
+    while (end > start and (value[end - 1] == ' ' or value[end - 1] == '\t')) : (end -= 1) {}
+    return value[start..end];
 }
 
 const BodyBuffer = struct {
@@ -463,8 +493,8 @@ fn recvOnce(fd: c.fd_t, buf: []u8) !usize {
     }
 }
 
-fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool, head_only: bool) !void {
-    if (canUseFastJsonBytes(res, keep_alive, head_only)) {
+fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool, send_keep_alive_header: bool, head_only: bool) !void {
+    if (canUseFastJsonBytes(res, keep_alive, send_keep_alive_header, head_only)) {
         return sendFastJsonBytes(fd, res.body);
     }
 
@@ -489,7 +519,11 @@ fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool, hea
         try sender.print(&scratch, "Content-Length: {d}\r\n", .{content_length});
     }
 
-    try sender.append(if (keep_alive) "Connection: keep-alive\r\n" else "Connection: close\r\n");
+    if (!keep_alive) {
+        try sender.append("Connection: close\r\n");
+    } else if (send_keep_alive_header) {
+        try sender.append("Connection: keep-alive\r\n");
+    }
 
     var has_content_type = false;
     for (res.headers.items) |header| {
@@ -538,8 +572,8 @@ fn sendResponse(fd: c.fd_t, res: *const response.Response, keep_alive: bool, hea
     }
 }
 
-fn canUseFastJsonBytes(res: *const response.Response, keep_alive: bool, head_only: bool) bool {
-    if (!keep_alive or head_only) return false;
+fn canUseFastJsonBytes(res: *const response.Response, keep_alive: bool, send_keep_alive_header: bool, head_only: bool) bool {
+    if (!keep_alive or send_keep_alive_header or head_only) return false;
     if (res.status_code != status.HTTP_200_OK) return false;
     if (res.body_kind != .bytes) return false;
     if (res.headers.items.len != 0) return false;
@@ -552,7 +586,7 @@ fn sendFastJsonBytes(fd: c.fd_t, body: []const u8) !void {
     var len: usize = 0;
 
     const prefix = "HTTP/1.1 200 OK\r\nContent-Length: ";
-    const middle = "\r\nConnection: keep-alive\r\nContent-Type: application/json\r\n\r\n";
+    const middle = "\r\nContent-Type: application/json\r\n\r\n";
     const max_len = prefix.len + 20 + middle.len + body.len;
     if (max_len > buf.len) {
         var sender = BufferedSender.init(fd);
@@ -712,9 +746,21 @@ test "parse HTTP request head" {
     try std.testing.expectEqualStrings("GET", parsed.method);
     try std.testing.expectEqualStrings("/users/42?verbose=true", parsed.target);
     try std.testing.expect(parsed.keep_alive);
+    try std.testing.expect(!parsed.send_keep_alive_header);
     try std.testing.expectEqual(@as(usize, 2), parsed.headers.len);
     try std.testing.expectEqualStrings("Host", parsed.headers[0].name);
     try std.testing.expectEqualStrings("localhost", parsed.headers[0].value);
+}
+
+test "parse HTTP/1.0 explicit keep-alive" {
+    var headers: [8]request.HeaderPair = undefined;
+    const parsed = try parseRequestHead(
+        "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+        &headers,
+    );
+
+    try std.testing.expect(parsed.keep_alive);
+    try std.testing.expect(parsed.send_keep_alive_header);
 }
 
 test "parse HTTP request content length" {
