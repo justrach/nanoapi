@@ -29,8 +29,25 @@ pub fn Context(comptime PathParams: type, comptime QueryParams: type) type {
     };
 }
 
+pub fn ContextWithBody(comptime PathParams: type, comptime QueryParams: type, comptime BodyModel: type) type {
+    assertStruct(PathParams);
+    assertStruct(QueryParams);
+    assertStruct(BodyModel);
+
+    return struct {
+        raw: *request.Request,
+        path: PathParams,
+        query: QueryParams,
+        body: BodyModel,
+    };
+}
+
 pub fn Handler(comptime PathParams: type, comptime QueryParams: type) type {
     return *const fn (Context(PathParams, QueryParams)) anyerror!response.Response;
+}
+
+pub fn HandlerWithBody(comptime PathParams: type, comptime QueryParams: type, comptime BodyModel: type) type {
+    return *const fn (ContextWithBody(PathParams, QueryParams, BodyModel)) anyerror!response.Response;
 }
 
 pub fn adapt(
@@ -55,6 +72,33 @@ pub fn adapt(
     }.call;
 }
 
+pub fn adaptWithBody(
+    comptime PathParams: type,
+    comptime QueryParams: type,
+    comptime BodyModel: type,
+    comptime handler: HandlerWithBody(PathParams, QueryParams, BodyModel),
+) routing.Handler {
+    return struct {
+        fn call(req: *request.Request) anyerror!response.Response {
+            const path = parsePath(PathParams, req) catch |err| {
+                return parseErrorResponse(req.allocator, err);
+            };
+            const query = parseQuery(QueryParams, req) catch |err| {
+                return parseErrorResponse(req.allocator, err);
+            };
+            const body = parseBody(BodyModel, req) catch |err| {
+                return parseErrorResponse(req.allocator, err);
+            };
+            return handler(.{
+                .raw = req,
+                .path = path,
+                .query = query,
+                .body = body,
+            });
+        }
+    }.call;
+}
+
 pub fn get(
     api: anytype,
     comptime PathParams: type,
@@ -72,6 +116,24 @@ pub fn get(
     try api.get(path, adapt(PathParams, QueryParams, handler), options);
 }
 
+pub fn postWithBody(
+    api: anytype,
+    comptime PathParams: type,
+    comptime QueryParams: type,
+    comptime BodyModel: type,
+    path: []const u8,
+    comptime handler: HandlerWithBody(PathParams, QueryParams, BodyModel),
+    route_options: meta.RouteOptions,
+) !void {
+    const allocator = api.allocator;
+    const generated = try allocParameters(allocator, PathParams, QueryParams);
+    defer freeParameters(allocator, generated);
+
+    var options = route_options;
+    options.parameters = generated;
+    try api.post(path, adaptWithBody(PathParams, QueryParams, BodyModel, handler), options);
+}
+
 pub fn parsePath(comptime T: type, req: *const request.Request) ParseError!T {
     assertStruct(T);
     const fields = @typeInfo(T).@"struct".fields;
@@ -84,6 +146,14 @@ pub fn parseQuery(comptime T: type, req: *const request.Request) ParseError!T {
     const fields = @typeInfo(T).@"struct".fields;
     if (comptime fields.len <= 1) return parseStruct(T, req, .query);
     return parseQueryStruct(T, req);
+}
+
+pub fn parseBody(comptime T: type, req: *const request.Request) ParseError!T {
+    assertStruct(T);
+    return dhi.parseAndValidate(T, req.body, req.allocator) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ValidationFailed,
+    };
 }
 
 pub fn allocParameters(
