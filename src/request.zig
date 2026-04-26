@@ -3,6 +3,48 @@ const core = @import("turboapi-core");
 
 pub const HeaderPair = core.HeaderPair;
 
+pub const FormField = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const UploadFile = struct {
+    field_name: []const u8,
+    filename: []const u8,
+    content_type: ?[]const u8 = null,
+    content: []const u8,
+};
+
+pub const FormData = struct {
+    allocator: std.mem.Allocator,
+    fields: std.ArrayList(FormField) = .empty,
+    files: std.ArrayList(UploadFile) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator) FormData {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *FormData) void {
+        self.files.deinit(self.allocator);
+        self.fields.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn field(self: *const FormData, name: []const u8) ?[]const u8 {
+        for (self.fields.items) |item| {
+            if (std.mem.eql(u8, item.name, name)) return item.value;
+        }
+        return null;
+    }
+
+    pub fn file(self: *const FormData, name: []const u8) ?UploadFile {
+        for (self.files.items) |item| {
+            if (std.mem.eql(u8, item.field_name, name)) return item;
+        }
+        return null;
+    }
+};
+
 pub const Request = struct {
     allocator: std.mem.Allocator,
     method: []const u8,
@@ -222,6 +264,48 @@ pub const Request = struct {
         return null;
     }
 
+    pub fn formData(self: *const Request) !FormData {
+        const content_type = self.header("content-type") orelse return error.InvalidContentType;
+        if (contentTypeMatches(content_type, "multipart/form-data")) {
+            return self.multipartFormData();
+        }
+        if (contentTypeMatches(content_type, "application/x-www-form-urlencoded")) {
+            return self.urlEncodedFormData();
+        }
+        return error.InvalidContentType;
+    }
+
+    pub fn multipartFormData(self: *const Request) !FormData {
+        const content_type = self.header("content-type") orelse return error.InvalidContentType;
+        const boundary = multipartBoundary(content_type) orelse return error.MissingMultipartBoundary;
+        return parseMultipart(self.allocator, self.body, boundary);
+    }
+
+    pub fn urlEncodedFormData(self: *const Request) !FormData {
+        var form = FormData.init(self.allocator);
+        errdefer form.deinit();
+
+        var pos: usize = 0;
+        while (pos <= self.body.len) {
+            const pair_start = pos;
+            const pair_end = std.mem.indexOfScalarPos(u8, self.body, pair_start, '&') orelse self.body.len;
+            pos = if (pair_end < self.body.len) pair_end + 1 else self.body.len + 1;
+
+            const pair = self.body[pair_start..pair_end];
+            if (pair.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse {
+                try form.fields.append(self.allocator, .{ .name = pair, .value = "" });
+                continue;
+            };
+            try form.fields.append(self.allocator, .{
+                .name = pair[0..eq],
+                .value = pair[eq + 1 ..],
+            });
+        }
+
+        return form;
+    }
+
     pub fn percentDecodeQuery(self: *const Request, value: []const u8, buffer: []u8) []u8 {
         _ = self;
         return core.http.percentDecode(value, buffer);
@@ -268,6 +352,105 @@ fn commonHeaderName(id: Request.CommonHeader) []const u8 {
         .host => "host",
         .user_agent => "user-agent",
     };
+}
+
+fn contentTypeMatches(header: []const u8, media_type: []const u8) bool {
+    const end = std.mem.indexOfScalar(u8, header, ';') orelse header.len;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, header[0..end], " \t"), media_type);
+}
+
+fn multipartBoundary(content_type: []const u8) ?[]const u8 {
+    var params = std.mem.splitScalar(u8, content_type, ';');
+    _ = params.next();
+    while (params.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const key = std.mem.trim(u8, trimmed[0..eq], " \t");
+        if (!std.ascii.eqlIgnoreCase(key, "boundary")) continue;
+        return unquote(std.mem.trim(u8, trimmed[eq + 1 ..], " \t"));
+    }
+    return null;
+}
+
+fn parseMultipart(allocator: std.mem.Allocator, body: []const u8, boundary: []const u8) !FormData {
+    if (boundary.len == 0) return error.MissingMultipartBoundary;
+
+    const marker = try std.fmt.allocPrint(allocator, "--{s}", .{boundary});
+    defer allocator.free(marker);
+    const next_marker = try std.fmt.allocPrint(allocator, "\r\n--{s}", .{boundary});
+    defer allocator.free(next_marker);
+
+    var form = FormData.init(allocator);
+    errdefer form.deinit();
+
+    var pos: usize = 0;
+    while (true) {
+        if (!std.mem.startsWith(u8, body[pos..], marker)) return error.InvalidMultipartBody;
+        pos += marker.len;
+
+        if (std.mem.startsWith(u8, body[pos..], "--")) break;
+        if (!std.mem.startsWith(u8, body[pos..], "\r\n")) return error.InvalidMultipartBody;
+        pos += 2;
+
+        const header_end = std.mem.indexOfPos(u8, body, pos, "\r\n\r\n") orelse return error.InvalidMultipartBody;
+        const headers = body[pos..header_end];
+        pos = header_end + 4;
+
+        const data_end = std.mem.indexOfPos(u8, body, pos, next_marker) orelse return error.InvalidMultipartBody;
+        const data = body[pos..data_end];
+        pos = data_end + 2;
+
+        const disposition = multipartHeader(headers, "content-disposition") orelse return error.InvalidMultipartBody;
+        const name = headerParam(disposition, "name") orelse return error.InvalidMultipartBody;
+        const content_type = multipartHeader(headers, "content-type");
+
+        if (headerParam(disposition, "filename")) |filename| {
+            try form.files.append(allocator, .{
+                .field_name = name,
+                .filename = filename,
+                .content_type = content_type,
+                .content = data,
+            });
+        } else {
+            try form.fields.append(allocator, .{
+                .name = name,
+                .value = data,
+            });
+        }
+    }
+
+    return form;
+}
+
+fn multipartHeader(headers: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const header_name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(header_name, name)) continue;
+        return std.mem.trim(u8, line[colon + 1 ..], " \t");
+    }
+    return null;
+}
+
+fn headerParam(value: []const u8, name: []const u8) ?[]const u8 {
+    var parts = std.mem.splitScalar(u8, value, ';');
+    _ = parts.next();
+    while (parts.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const key = std.mem.trim(u8, trimmed[0..eq], " \t");
+        if (!std.ascii.eqlIgnoreCase(key, name)) continue;
+        return unquote(std.mem.trim(u8, trimmed[eq + 1 ..], " \t"));
+    }
+    return null;
+}
+
+fn unquote(value: []const u8) []const u8 {
+    if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+        return value[1 .. value.len - 1];
+    }
+    return value;
 }
 
 test "Request caches common headers from initParts" {
@@ -327,4 +510,46 @@ test "Request common headers fall back for struct literals without cache" {
 
     try std.testing.expectEqualStrings("Bearer literal", req.header("authorization").?);
     try std.testing.expectEqualStrings("literal", req.cookie("session").?);
+}
+
+test "Request parses multipart form fields and files" {
+    const body =
+        "--nano-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"title\"\r\n" ++
+        "\r\n" ++
+        "hello\r\n" ++
+        "--nano-boundary\r\n" ++
+        "Content-Disposition: form-data; name=\"upload\"; filename=\"note.txt\"\r\n" ++
+        "Content-Type: text/plain\r\n" ++
+        "\r\n" ++
+        "file bytes\r\n" ++
+        "--nano-boundary--\r\n";
+    const headers = [_]HeaderPair{
+        .{ .name = "Content-Type", .value = "multipart/form-data; boundary=nano-boundary" },
+    };
+    const req = Request.init(std.testing.allocator, "POST", "/upload", &headers, body);
+
+    var form = try req.formData();
+    defer form.deinit();
+
+    try std.testing.expectEqualStrings("hello", form.field("title").?);
+    const file_value = form.file("upload").?;
+    try std.testing.expectEqualStrings("upload", file_value.field_name);
+    try std.testing.expectEqualStrings("note.txt", file_value.filename);
+    try std.testing.expectEqualStrings("text/plain", file_value.content_type.?);
+    try std.testing.expectEqualStrings("file bytes", file_value.content);
+}
+
+test "Request parses urlencoded form fields" {
+    const headers = [_]HeaderPair{
+        .{ .name = "Content-Type", .value = "application/x-www-form-urlencoded" },
+    };
+    const req = Request.init(std.testing.allocator, "POST", "/submit", &headers, "name=rach&empty=&flag");
+
+    var form = try req.formData();
+    defer form.deinit();
+
+    try std.testing.expectEqualStrings("rach", form.field("name").?);
+    try std.testing.expectEqualStrings("", form.field("empty").?);
+    try std.testing.expectEqualStrings("", form.field("flag").?);
 }

@@ -2,7 +2,7 @@
 
 NanoAPI is a pure Zig HTTP API framework with FastAPI-inspired ergonomics:
 typed route parameters, response helpers, OpenAPI metadata, streaming responses,
-and a small multi-worker native HTTP/1.1 server.
+middleware, upload helpers, and a small multi-worker native HTTP/1.1 server.
 
 The hot routing path is backed by `turboapi-core`, while validation primitives
 come from `dhi`. The current dependency pin uses the `dhi` performance branch
@@ -89,9 +89,20 @@ try app.getTyped(PathParams, QueryParams, "/users/{user_id}", getUser, .{});
 ## Responses
 
 NanoAPI includes response helpers for JSON, text, HTML, redirects, file bodies,
-chunked streams, and server-sent events.
+chunked streams, server-sent events, and LLM-style token streams.
 
 ```zig
+fn tokens(ctx: *nano.StreamContext) !void {
+    var llm = nano.LLMStreamWriter.init(ctx);
+    try llm.token("hel");
+    try llm.token("lo");
+    try llm.done();
+}
+
+fn chat(req: *nano.Request) !nano.Response {
+    return nano.LLMStreamResponse.init(req.allocator, tokens, .{});
+}
+
 fn events(ctx: *nano.StreamContext) !void {
     var sse = nano.SseWriter.init(ctx);
     try sse.event("ready", "hello", "1");
@@ -105,6 +116,80 @@ fn download(req: *nano.Request) !nano.Response {
     return nano.FileResponse.init(req.allocator, "assets/report.pdf", null, .{});
 }
 ```
+
+## Middleware
+
+Middleware wraps request handling in registration order. Call `ctx.next()` to
+continue to the next middleware or route handler, or return a response directly
+to short-circuit.
+
+```zig
+fn auth(ctx: *nano.MiddlewareContext) !nano.Response {
+    if (ctx.req.header("authorization") == null) {
+        return nano.JSONResponse.static(ctx.req.allocator, "{\"detail\":\"unauthorized\"}", .{
+            .status_code = nano.status.HTTP_401_UNAUTHORIZED,
+        });
+    }
+    var res = try ctx.next();
+    errdefer res.deinit();
+    try res.setHeader("x-api", "nano");
+    return res;
+}
+
+try app.addMiddleware(auth);
+```
+
+## Forms And Uploads
+
+`Request.formData()` parses `multipart/form-data` and
+`application/x-www-form-urlencoded` request bodies. Parsed values are slices into
+the request body and remain valid for the current request.
+
+```zig
+fn upload(req: *nano.Request) !nano.Response {
+    var form = try req.formData();
+    defer form.deinit();
+
+    const title = form.field("title") orelse "";
+    const file = form.file("file") orelse return nano.response.jsonError(
+        req.allocator,
+        nano.status.HTTP_422_UNPROCESSABLE_ENTITY,
+        "missing file",
+        &.{},
+    );
+
+    _ = title;
+    _ = file.content;
+    return nano.JSONResponse.static(req.allocator, "{\"ok\":true}", .{});
+}
+```
+
+## Serverless
+
+The serverless core adapter is in `nano.serverless`. It turns a platform-neutral
+invocation into a normal NanoAPI request, so middleware and routing behave the
+same as the native server path.
+
+```zig
+var out = try nano.serverless.handleBytes(&app, allocator, nano.ServerlessInvocation.init(
+    "GET",
+    "/users/42?verbose=true",
+    &.{},
+    "",
+));
+defer out.deinit();
+```
+
+AWS HTTP API v2 / Lambda Function URL JSON events can use the first platform
+adapter:
+
+```zig
+const lambda_response_json = try nano.aws_http_v2.handleJson(&app, allocator, event_json);
+defer allocator.free(lambda_response_json);
+```
+
+The longer adapter and infrastructure plan lives in
+[`architecture.md`](architecture.md).
 
 ## Server Runtime
 
@@ -134,8 +219,9 @@ NanoAPI is currently optimized around a small number of hot paths:
 - exact `GET /` dispatch avoids the radix router entirely
 - exact static routes are cached before falling through to parameterized routing
 - parsed request path/query slices are threaded into `Request`
+- middleware falls through with one tiny context object around the router
 - typed routes skip DHI validation when no validation convention is present
-- common `200 application/json` byte responses use a compact fast write path
+- common `200 application/json` byte responses use a compact contiguous write path for small bodies
 - HTTP/1.1 keep-alive responses avoid redundant connection headers
 - kqueue event-loop workers can spread accepted connections across cores
 
@@ -163,7 +249,7 @@ req/s, and xitca-web averaged 134.8k req/s.
 Treat these numbers as directional; they vary by machine, thermal state, Zig
 build, and background load.
 
-The next likely performance wins are worker scheduling/backlog tuning,
+The next likely performance wins are worker scheduling tuning,
 request/response arena reuse, lower-copy writes, better request parser state
 reuse, specialized typed query parsers, and stricter benchmark regression
 thresholds.
@@ -199,7 +285,12 @@ Done:
 
 - `NanoAPI` and `APIRouter`
 - typed path/query structs
+- middleware stack
 - JSON, text, HTML, redirect, file, stream, and SSE responses
+- LLM-style token streaming over SSE
+- multipart file uploads and URL-encoded form parsing
+- serverless invocation core adapter
+- AWS HTTP API v2 serverless adapter
 - cookie helpers
 - status constants
 - security metadata helpers
@@ -209,9 +300,8 @@ Done:
 
 Next:
 
-- middleware stack
+- Fetch-style serverless adapter
 - dependency injection execution
-- file uploads and form parsing
 - WebSocket upgrade routes
 - optional HTTP/3 and QUIC transport sharing the same app/router layer
 

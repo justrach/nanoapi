@@ -3,3 +3,16 @@ zig-out/
 zig-pkg/
 codedb.snapshot
 bench-results/
+architecture.md
+architecture/
+
+# Generated serverless and infrastructure artifacts
+.aws-sam/
+.serverless/
+.terraform/
+.wrangler/
+.vercel/
+.netlify/
+cdk.out/
+terraform.tfstate
+terraform.tfstate.*
