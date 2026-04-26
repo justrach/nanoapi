@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
     var app = try nano.NanoAPI.init(allocator, .{ .title = "NanoAPI wrk bench" });
     defer app.deinit();
 
-    try app.get("/", root, .{});
+    try app.getStaticJson("/", "{\"ok\":true}", .{});
     try app.getTyped(PathParams, QueryParams, "/users/{user_id}", user, .{});
     try app.postTypedBody(nano.typed.Empty, nano.typed.Empty, BodyModel, "/users", createUser, .{});
     try app.get("/auth", auth, .{});

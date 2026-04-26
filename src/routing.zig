@@ -24,11 +24,16 @@ pub const RouteDefinition = struct {
     path: []const u8,
     handler: Handler,
     options: meta.RouteOptions,
+    /// Pre-rendered full HTTP response bytes (status line + headers + body).
+    /// When set, the server hot path can emit these directly without invoking the handler,
+    /// constructing a Response, or formatting Content-Length.
+    static_response: ?[]const u8 = null,
 
     fn deinit(self: *RouteDefinition, allocator: std.mem.Allocator) void {
         allocator.free(self.key);
         allocator.free(self.method);
         allocator.free(self.path);
+        if (self.static_response) |bytes| allocator.free(bytes);
         freeRouteOptions(allocator, self.options);
         self.* = undefined;
     }
@@ -36,6 +41,7 @@ pub const RouteDefinition = struct {
 
 const ExactRoute = struct {
     method: []const u8,
+    method_slot: u3,
     path: []const u8,
     index: usize,
 };
@@ -75,6 +81,8 @@ pub const APIRouter = struct {
     exact_routes: std.ArrayList(ExactRoute) = .empty,
     exact_route_map: ExactRouteMap = .empty,
     exact_method_mask: u8 = 0,
+    exact_min_path_len: [8]usize = [_]usize{std.math.maxInt(usize)} ** 8,
+    exact_max_path_len: [8]usize = [_]usize{0} ** 8,
     root_get_index: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, router_options: RouterOptions) !APIRouter {
@@ -168,9 +176,25 @@ pub const APIRouter = struct {
         }
 
         const exact_method_mask = self.exact_method_mask;
-        if (exact_method_mask != 0 and (exact_method_mask & methodMaskBit(req.method)) != 0) {
-            if (self.exact_route_map.getContext(.{ .method = req.method, .path = req.path }, .{})) |index| {
-                return self.routes_list.items[index].handler(req);
+        if (exact_method_mask != 0) {
+            const exact_method_slot = methodSlot(req.method);
+            if ((exact_method_mask & methodSlotMaskBit(exact_method_slot)) != 0) {
+                if (self.exact_routes.items.len <= 8) {
+                    if (req.path.len >= self.exact_min_path_len[exact_method_slot] and req.path.len <= self.exact_max_path_len[exact_method_slot]) {
+                        for (self.exact_routes.items) |exact_route| {
+                            if (exact_route.method_slot == exact_method_slot and
+                                (exact_method_slot != customMethodSlot or std.mem.eql(u8, exact_route.method, req.method)) and
+                                std.mem.eql(u8, exact_route.path, req.path))
+                            {
+                                return self.routes_list.items[exact_route.index].handler(req);
+                            }
+                        }
+                    }
+                } else {
+                    if (self.exact_route_map.getContext(.{ .method = req.method, .path = req.path }, .{})) |index| {
+                        return self.routes_list.items[index].handler(req);
+                    }
+                }
             }
         }
 
@@ -185,6 +209,66 @@ pub const APIRouter = struct {
         defer req.path_params = null;
 
         return self.routes_list.items[index].handler(req);
+    }
+    /// Fast static-dispatch path: if the request matches an exact route that has a
+    /// pre-rendered HTTP response, return those bytes directly. Skips the handler call,
+    /// Response struct construction, Content-Length formatting, and canUseFastJsonBytes
+    /// dispatch. Returns null if no static route matches; the caller should fall through
+    /// to the normal handle() path.
+    pub fn tryStaticDispatch(self: *const APIRouter, method: []const u8, path: []const u8) ?[]const u8 {
+        if (self.root_get_index) |index| {
+            if (path.len == 1 and path[0] == '/' and std.mem.eql(u8, method, "GET")) {
+                return self.routes_list.items[index].static_response;
+            }
+        }
+
+        const exact_method_mask = self.exact_method_mask;
+        if (exact_method_mask == 0) return null;
+        const exact_method_slot = methodSlot(method);
+        if ((exact_method_mask & methodSlotMaskBit(exact_method_slot)) == 0) return null;
+
+        if (self.exact_routes.items.len <= 8) {
+            if (path.len < self.exact_min_path_len[exact_method_slot]) return null;
+            if (path.len > self.exact_max_path_len[exact_method_slot]) return null;
+            for (self.exact_routes.items) |exact_route| {
+                if (exact_route.method_slot == exact_method_slot and
+                    (exact_method_slot != customMethodSlot or std.mem.eql(u8, exact_route.method, method)) and
+                    std.mem.eql(u8, exact_route.path, path))
+                {
+                    return self.routes_list.items[exact_route.index].static_response;
+                }
+            }
+            return null;
+        }
+        if (self.exact_route_map.getContext(.{ .method = method, .path = path }, .{})) |index| {
+            return self.routes_list.items[index].static_response;
+        }
+        return null;
+    }
+
+    /// Register a route whose response is fully pre-rendered at registration time.
+    /// `http_response_bytes` must contain the complete HTTP response (status line,
+    /// headers, blank line, body) and is freed when the route is destroyed.
+    pub fn routeStaticBytes(
+        self: *APIRouter,
+        method: []const u8,
+        path: []const u8,
+        http_response_bytes: []u8,
+        route_options: meta.RouteOptions,
+    ) !void {
+        try self.routeWithInheritedTagsStatic(method, path, route_options, self.tags, http_response_bytes);
+    }
+
+    /// Convenience: pre-render a "200 OK application/json" response and register it.
+    pub fn getStaticJson(
+        self: *APIRouter,
+        path: []const u8,
+        body: []const u8,
+        route_options: meta.RouteOptions,
+    ) !void {
+        const bytes = try renderStaticJsonResponse(self.allocator, body);
+        errdefer self.allocator.free(bytes);
+        try self.routeStaticBytes("GET", path, bytes, route_options);
     }
 
     pub fn routes(self: *const APIRouter) []const RouteDefinition {
@@ -237,9 +321,11 @@ pub const APIRouter = struct {
         if (is_root_get) {
             self.root_get_index = index;
         } else if (is_exact_non_root) {
+            const exact_method_slot = methodSlot(owned_method);
             const exact_key = ExactRouteKey{ .method = owned_method, .path = full_path };
             self.exact_routes.appendAssumeCapacity(.{
                 .method = owned_method,
+                .method_slot = exact_method_slot,
                 .path = full_path,
                 .index = index,
             });
@@ -247,33 +333,119 @@ pub const APIRouter = struct {
             if (!gop.found_existing) {
                 gop.value_ptr.* = index;
             }
-            self.exact_method_mask |= methodMaskBit(owned_method);
+            self.exact_method_mask |= methodSlotMaskBit(exact_method_slot);
+            self.exact_min_path_len[exact_method_slot] = @min(self.exact_min_path_len[exact_method_slot], full_path.len);
+            self.exact_max_path_len[exact_method_slot] = @max(self.exact_max_path_len[exact_method_slot], full_path.len);
+        }
+    }
+
+    fn routeWithInheritedTagsStatic(
+        self: *APIRouter,
+        method: []const u8,
+        path: []const u8,
+        route_options: meta.RouteOptions,
+        inherited_tags: []const []const u8,
+        http_response_bytes: []u8,
+    ) !void {
+        if (path.len == 0 or path[0] != '/') return error.InvalidPath;
+
+        const full_path = try joinPath(self.allocator, self.prefix, path);
+        errdefer self.allocator.free(full_path);
+
+        const index = self.routes_list.items.len;
+        const key = try routeKeyForIndex(self.allocator, index);
+        errdefer self.allocator.free(key);
+
+        const owned_method = try self.allocator.dupe(u8, method);
+        errdefer self.allocator.free(owned_method);
+
+        const owned_options = try cloneRouteOptions(self.allocator, method, full_path, route_options, inherited_tags);
+        errdefer freeRouteOptions(self.allocator, owned_options);
+
+        const route_def = RouteDefinition{
+            .key = key,
+            .method = owned_method,
+            .path = full_path,
+            .handler = staticPlaceholderHandler,
+            .options = owned_options,
+            .static_response = http_response_bytes,
+        };
+
+        const is_root_get = std.mem.eql(u8, owned_method, "GET") and std.mem.eql(u8, full_path, "/");
+        const is_exact_non_root = !is_root_get and isExactPath(full_path);
+        if (is_exact_non_root) {
+            try self.exact_routes.ensureUnusedCapacity(self.allocator, 1);
+            try self.exact_route_map.ensureUnusedCapacityContext(self.allocator, 1, .{});
+        }
+
+        try self.routes_list.append(self.allocator, route_def);
+        errdefer _ = self.routes_list.pop();
+
+        try self.core_router.addRoute(method, full_path, key);
+
+        if (is_root_get) {
+            self.root_get_index = index;
+        } else if (is_exact_non_root) {
+            const exact_method_slot = methodSlot(owned_method);
+            const exact_key = ExactRouteKey{ .method = owned_method, .path = full_path };
+            self.exact_routes.appendAssumeCapacity(.{
+                .method = owned_method,
+                .method_slot = exact_method_slot,
+                .path = full_path,
+                .index = index,
+            });
+            const gop = self.exact_route_map.getOrPutAssumeCapacityContext(exact_key, .{});
+            if (!gop.found_existing) {
+                gop.value_ptr.* = index;
+            }
+            self.exact_method_mask |= methodSlotMaskBit(exact_method_slot);
+            self.exact_min_path_len[exact_method_slot] = @min(self.exact_min_path_len[exact_method_slot], full_path.len);
+            self.exact_max_path_len[exact_method_slot] = @max(self.exact_max_path_len[exact_method_slot], full_path.len);
         }
     }
 };
 
+/// Fallback handler for static routes that gets invoked only on the slow paths
+/// (custom middleware, includeRouter remap, parameterised paths). It re-emits the
+/// pre-rendered body so behaviour stays identical even if the static dispatch
+/// shortcut was bypassed.
+fn staticPlaceholderHandler(req: *request.Request) anyerror!response.Response {
+    return response.jsonError(req.allocator, status.HTTP_500_INTERNAL_SERVER_ERROR, "Static route invoked through dynamic dispatch", &.{});
+}
+
+/// Build a fully formed "HTTP/1.1 200 OK\r\nContent-Length: N\r\nContent-Type: application/json\r\n\r\n<body>"
+/// response. Returned slice is owned by the caller (and ultimately the route).
+fn renderStaticJsonResponse(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nContent-Type: application/json\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+}
 fn isExactPath(path: []const u8) bool {
     return std.mem.indexOfAny(u8, path, "{*") == null;
 }
 
-fn methodMaskBit(method: []const u8) u8 {
-    return @as(u8, 1) << methodSlot(method);
+fn methodSlotMaskBit(slot: u3) u8 {
+    return @as(u8, 1) << slot;
 }
 
+const customMethodSlot: u3 = 7;
+
 fn methodSlot(method: []const u8) u3 {
-    if (method.len < 3) return 7;
+    if (method.len < 3) return customMethodSlot;
     return switch (method[0]) {
-        'G' => if (method.len == 3 and method[1] == 'E' and method[2] == 'T') 0 else 7,
+        'G' => if (method.len == 3 and method[1] == 'E' and method[2] == 'T') 0 else customMethodSlot,
         'P' => switch (method.len) {
-            3 => if (method[1] == 'U' and method[2] == 'T') 2 else 7,
-            4 => if (method[1] == 'O' and method[2] == 'S' and method[3] == 'T') 1 else 7,
-            5 => if (method[1] == 'A' and method[2] == 'T' and method[3] == 'C' and method[4] == 'H') 4 else 7,
-            else => 7,
+            3 => if (method[1] == 'U' and method[2] == 'T') 2 else customMethodSlot,
+            4 => if (method[1] == 'O' and method[2] == 'S' and method[3] == 'T') 1 else customMethodSlot,
+            5 => if (method[1] == 'A' and method[2] == 'T' and method[3] == 'C' and method[4] == 'H') 4 else customMethodSlot,
+            else => customMethodSlot,
         },
-        'D' => if (method.len == 6 and std.mem.eql(u8, method, "DELETE")) 3 else 7,
-        'H' => if (method.len == 4 and std.mem.eql(u8, method, "HEAD")) 5 else 7,
-        'O' => if (method.len == 7 and std.mem.eql(u8, method, "OPTIONS")) 6 else 7,
-        else => 7,
+        'D' => if (method.len == 6 and std.mem.eql(u8, method, "DELETE")) 3 else customMethodSlot,
+        'H' => if (method.len == 4 and std.mem.eql(u8, method, "HEAD")) 5 else customMethodSlot,
+        'O' => if (method.len == 7 and std.mem.eql(u8, method, "OPTIONS")) 6 else customMethodSlot,
+        else => customMethodSlot,
     };
 }
 
