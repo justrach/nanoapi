@@ -13,6 +13,23 @@ pub const EventType = enum {
 };
 
 pub const EventHandler = *const fn () anyerror!void;
+pub const MiddlewareFn = *const fn (*MiddlewareContext) anyerror!response.Response;
+
+pub const MiddlewareContext = struct {
+    app: *App,
+    req: *request.Request,
+    index: usize = 0,
+
+    pub fn next(self: *MiddlewareContext) !response.Response {
+        if (self.index >= self.app.middlewares.items.len) {
+            return self.app.router.handle(self.req);
+        }
+
+        const middleware = self.app.middlewares.items[self.index];
+        self.index += 1;
+        return middleware(self);
+    }
+};
 
 pub const AppOptions = struct {
     title: []const u8 = "NanoAPI",
@@ -32,6 +49,7 @@ pub const App = struct {
     redoc_url: ?[]const u8,
     openapi_url: ?[]const u8,
     router: routing.APIRouter,
+    middlewares: std.ArrayList(MiddlewareFn) = .empty,
     startup_handlers: std.ArrayList(EventHandler) = .empty,
     shutdown_handlers: std.ArrayList(EventHandler) = .empty,
 
@@ -67,6 +85,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         self.shutdown_handlers.deinit(self.allocator);
         self.startup_handlers.deinit(self.allocator);
+        self.middlewares.deinit(self.allocator);
         self.router.deinit();
         if (self.openapi_url) |v| self.allocator.free(v);
         if (self.redoc_url) |v| self.allocator.free(v);
@@ -89,6 +108,15 @@ pub const App = struct {
 
     pub fn get(self: *App, path: []const u8, handler: routing.Handler, route_options: meta.RouteOptions) !void {
         try self.router.get(path, handler, route_options);
+    }
+
+    /// Register a GET route whose JSON response is fully pre-rendered at registration
+    /// time. Hitting this route on the event-loop runtime skips the handler call,
+    /// Response struct, Content-Length formatting, and the canUseFastJsonBytes check —
+    /// the dispatcher just memcpys the cached bytes into the per-connection write
+    /// buffer.
+    pub fn getStaticJson(self: *App, path: []const u8, body: []const u8, route_options: meta.RouteOptions) !void {
+        try self.router.getStaticJson(path, body, route_options);
     }
 
     pub fn getTyped(
@@ -142,8 +170,18 @@ pub const App = struct {
         try self.router.includeRouter(router, include_options);
     }
 
+    pub fn addMiddleware(self: *App, middleware: MiddlewareFn) !void {
+        try self.middlewares.append(self.allocator, middleware);
+    }
+
     pub fn handle(self: *App, req: *request.Request) !response.Response {
-        return self.router.handle(req);
+        if (self.middlewares.items.len == 0) return self.router.handle(req);
+
+        var ctx = MiddlewareContext{
+            .app = self,
+            .req = req,
+        };
+        return ctx.next();
     }
 
     pub fn listenAndServe(self: *App, allocator: std.mem.Allocator, server_options: @import("server.zig").Options) !void {

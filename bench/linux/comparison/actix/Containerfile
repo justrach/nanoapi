@@ -1,0 +1,14 @@
+FROM rust:alpine AS build
+RUN apk add --no-cache musl-dev pkgconfig
+WORKDIR /src
+COPY Cargo.toml /src/Cargo.toml
+RUN mkdir -p /src/src
+COPY src/main.rs /src/src/main.rs
+RUN cargo build --release && \
+    mkdir -p /out && cp target/release/actixbench /out/
+
+FROM alpine:3.20
+RUN apk add --no-cache wrk curl
+COPY --from=build /out/actixbench /usr/local/bin/actixbench
+EXPOSE 8080
+CMD ["/usr/local/bin/actixbench"]

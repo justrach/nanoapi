@@ -12,17 +12,23 @@ pub const response = @import("response.zig");
 pub const routing = @import("routing.zig");
 pub const security = @import("security.zig");
 pub const server = @import("server.zig");
+pub const serverless = @import("serverless.zig");
 pub const status = @import("status.zig");
 pub const typed = @import("typed.zig");
 pub const validation = @import("validation.zig");
 
 pub const App = app.App;
 pub const NanoAPI = app.App;
+pub const MiddlewareContext = app.MiddlewareContext;
+pub const MiddlewareFn = app.MiddlewareFn;
 pub const APIRouter = routing.APIRouter;
 pub const Router = routing.APIRouter;
 
 pub const Request = request.Request;
 pub const HeaderPair = request.HeaderPair;
+pub const FormData = request.FormData;
+pub const FormField = request.FormField;
+pub const UploadFile = request.UploadFile;
 
 pub const Response = response.Response;
 pub const JSONResponse = response.JSONResponse;
@@ -32,8 +38,14 @@ pub const RedirectResponse = response.RedirectResponse;
 pub const FileResponse = response.FileResponse;
 pub const StreamingResponse = response.StreamingResponse;
 pub const EventSourceResponse = response.EventSourceResponse;
+pub const LLMStreamResponse = response.LLMStreamResponse;
 pub const StreamContext = response.StreamContext;
 pub const SseWriter = response.SseWriter;
+pub const LLMStreamWriter = response.LLMStreamWriter;
+
+pub const ServerlessInvocation = serverless.Invocation;
+pub const ServerlessResponse = serverless.ServerlessResponse;
+pub const aws_http_v2 = serverless.aws_http_v2;
 
 pub const Path = params.Path;
 pub const Query = params.Query;
@@ -113,6 +125,67 @@ test "NanoAPI registers and dispatches routes through turboapi-core" {
     try std.testing.expectEqual(@as(u16, 200), resp.status_code);
     try std.testing.expectEqualStrings("application/json", resp.header("content-type").?);
     try std.testing.expectEqualStrings("{\"user_id\":42,\"verbose\":true}", resp.body);
+}
+
+test "NanoAPI middleware wraps router responses in registration order" {
+    const allocator = std.testing.allocator;
+    var api = try NanoAPI.init(allocator, .{});
+    defer api.deinit();
+
+    const Middleware = struct {
+        fn first(ctx: *MiddlewareContext) !Response {
+            var res = try ctx.next();
+            errdefer res.deinit();
+            try res.setHeader("x-first", "1");
+            return res;
+        }
+
+        fn second(ctx: *MiddlewareContext) !Response {
+            var res = try ctx.next();
+            errdefer res.deinit();
+            try res.setHeader("x-second", "2");
+            return res;
+        }
+    };
+
+    try api.addMiddleware(Middleware.first);
+    try api.addMiddleware(Middleware.second);
+    try api.get("/", rootHandler, .{});
+
+    var req = Request.init(allocator, "GET", "/", &.{}, "");
+    var resp = try api.handle(&req);
+    defer resp.deinit();
+
+    try std.testing.expectEqualStrings("1", resp.header("x-first").?);
+    try std.testing.expectEqualStrings("2", resp.header("x-second").?);
+    try std.testing.expectEqualStrings("{\"message\":\"Hello\"}", resp.body);
+}
+
+test "NanoAPI middleware can short-circuit requests" {
+    const allocator = std.testing.allocator;
+    var api = try NanoAPI.init(allocator, .{});
+    defer api.deinit();
+
+    const Middleware = struct {
+        fn auth(ctx: *MiddlewareContext) !Response {
+            if (ctx.req.header("authorization") == null) {
+                return JSONResponse.static(ctx.req.allocator, "{\"detail\":\"unauthorized\"}", .{
+                    .status_code = status.HTTP_401_UNAUTHORIZED,
+                });
+            }
+            return ctx.next();
+        }
+    };
+
+    try api.addMiddleware(Middleware.auth);
+    try api.get("/", rootHandler, .{});
+
+    var req = Request.init(allocator, "GET", "/", &.{}, "");
+    var resp = try api.handle(&req);
+    defer resp.deinit();
+
+    try std.testing.expectEqual(@as(u16, status.HTTP_401_UNAUTHORIZED), resp.status_code);
+    try std.testing.expectEqualStrings("{\"detail\":\"unauthorized\"}", resp.body);
 }
 
 test "APIRouter includeRouter applies prefixes" {

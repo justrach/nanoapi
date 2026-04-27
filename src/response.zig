@@ -316,6 +316,13 @@ pub const FileResponse = struct {
         filename: ?[]const u8,
         options: ResponseOptions,
     ) !Response {
+        if (comptime @import("builtin").os.tag == .linux) {
+            // FileResponse currently relies on std.c-style fstat which isn't wired
+            // through this Zig version's std.os.linux. Until that's plumbed, callers
+            // on Linux must construct Responses with a known content size via
+            // Response.fromFilePath directly.
+            return error.FileResponseNotSupportedOnLinux;
+        }
         const fd = try posix.openat(c.AT.FDCWD, path, .{}, 0);
         defer _ = c.close(fd);
 
@@ -351,6 +358,16 @@ pub const EventSourceResponse = struct {
         if (res.header("cache-control") == null) try res.setHeader("cache-control", "no-cache");
         if (res.header("x-accel-buffering") == null) try res.setHeader("x-accel-buffering", "no");
         return res;
+    }
+};
+
+pub const LLMStreamResponse = struct {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        writer: StreamWriteFn,
+        options: ResponseOptions,
+    ) !Response {
+        return EventSourceResponse.init(allocator, writer, options);
     }
 };
 
@@ -455,6 +472,30 @@ pub const SseWriter = struct {
     }
 };
 
+pub const LLMStreamWriter = struct {
+    sse: SseWriter,
+
+    pub fn init(ctx: *StreamContext) LLMStreamWriter {
+        return .{ .sse = SseWriter.init(ctx) };
+    }
+
+    pub fn token(self: *LLMStreamWriter, content: []const u8) !void {
+        try self.sse.event(null, content, null);
+    }
+
+    pub fn event(self: *LLMStreamWriter, name: []const u8, data: []const u8) !void {
+        try self.sse.event(name, data, null);
+    }
+
+    pub fn errorMessage(self: *LLMStreamWriter, message: []const u8) !void {
+        try self.sse.event("error", message, null);
+    }
+
+    pub fn done(self: *LLMStreamWriter) !void {
+        try self.sse.event(null, "[DONE]", null);
+    }
+};
+
 fn appendSseBytes(buf: []u8, len: *usize, bytes: []const u8) bool {
     if (len.* + bytes.len > buf.len) return false;
     @memcpy(buf[len.*..][0..bytes.len], bytes);
@@ -548,6 +589,50 @@ test "streaming and SSE response helpers" {
     try Handler.stream(&ctx);
     try std.testing.expectEqualStrings(
         "id: 1\nevent: ready\ndata: hello\ndata: world\n\n",
+        sink.out.items,
+    );
+}
+
+test "LLM stream response emits token and done SSE frames" {
+    const allocator = std.testing.allocator;
+
+    const Handler = struct {
+        fn stream(ctx: *StreamContext) !void {
+            var llm = LLMStreamWriter.init(ctx);
+            try llm.token("hel");
+            try llm.token("lo");
+            try llm.done();
+        }
+    };
+
+    var res = try LLMStreamResponse.init(allocator, Handler.stream, .{});
+    defer res.deinit();
+    try std.testing.expectEqual(BodyKind.stream, res.body_kind);
+    try std.testing.expectEqualStrings("text/event-stream", res.header("content-type").?);
+
+    const Sink = struct {
+        out: std.ArrayList(u8) = .empty,
+
+        fn write(ptr: *anyopaque, bytes: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.out.appendSlice(std.testing.allocator, bytes);
+        }
+
+        fn flush(ptr: *anyopaque) !void {
+            _ = ptr;
+        }
+    };
+
+    var sink = Sink{};
+    defer sink.out.deinit(allocator);
+    var ctx = StreamContext{
+        .sink = &sink,
+        .write_fn = Sink.write,
+        .flush_fn = Sink.flush,
+    };
+    try Handler.stream(&ctx);
+    try std.testing.expectEqualStrings(
+        "data: hel\n\ndata: lo\n\ndata: [DONE]\n\n",
         sink.out.items,
     );
 }
