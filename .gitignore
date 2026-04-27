@@ -3,6 +3,7 @@ zig-out/
 zig-pkg/
 codedb.snapshot
 bench-results/
+.zigrep_archive
 architecture.md
 architecture/
 

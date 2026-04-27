@@ -1,0 +1,6 @@
+FROM alpine:3.20
+RUN apk add --no-cache wrk curl
+COPY nano_http_bench /usr/local/bin/nano_http_bench
+RUN chmod +x /usr/local/bin/nano_http_bench
+EXPOSE 8080
+CMD ["/usr/local/bin/nano_http_bench", "8080", "auto"]
