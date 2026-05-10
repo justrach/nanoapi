@@ -37,15 +37,38 @@ pub const Runtime = enum {
     io_uring,
 };
 
+/// Function the runtime calls to dispatch a parsed request to user code.
+/// `ctx` is the opaque pointer the dispatcher was registered with.
+pub const HandleFn = *const fn (ctx: *anyopaque, req: *request.Request) anyerror!response.Response;
+
+/// Optional fast path: returns pre-rendered HTTP response bytes for a static
+/// route, or null to fall back to the normal `handle()` call. Set to null on
+/// the dispatcher to disable the static-cache shortcut.
+pub const TryStaticDispatchFn = *const fn (ctx: *anyopaque, method: []const u8, path: []const u8) ?[]const u8;
+
+/// Returns true if the dispatcher has middleware registered. The runtime skips
+/// the static-cache shortcut when middleware is present so middlewares can run.
+pub const HasMiddlewareFn = *const fn (ctx: *anyopaque) bool;
+
+/// Vtable plugged into the runtime so non-`App` consumers (turboAPI's Python
+/// FFI dispatch, merjs' SSR dispatch) can drive the same accept loop, parser,
+/// and response writer that `App` uses internally.
+pub const Dispatcher = struct {
+    ctx: *anyopaque,
+    handle: HandleFn,
+    has_middleware: HasMiddlewareFn,
+    try_static_dispatch: ?TryStaticDispatchFn = null,
+};
+
 pub const Server = struct {
-    app: *app_mod.App,
+    dispatcher: Dispatcher,
     allocator: std.mem.Allocator,
     options: Options,
     listen_fd: c.fd_t = -1,
 
-    pub fn init(app: *app_mod.App, allocator: std.mem.Allocator, options: Options) Server {
+    pub fn init(dispatcher: Dispatcher, allocator: std.mem.Allocator, options: Options) Server {
         return .{
-            .app = app,
+            .dispatcher = dispatcher,
             .allocator = allocator,
             .options = options,
         };
@@ -237,7 +260,14 @@ fn effectiveRuntime(requested: Runtime) Runtime {
 }
 
 pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, options: Options) !void {
-    var server = Server.init(app, allocator, options);
+    return serveGeneric(app.dispatcher(), allocator, options);
+}
+
+/// Drive the runtime with any dispatcher — not just `App`. Use this from
+/// non-`App` consumers (turboAPI's Python FFI, merjs' SSR pipeline) by
+/// constructing a `Dispatcher` with your own ctx + adapter functions.
+pub fn serveGeneric(dispatcher: Dispatcher, allocator: std.mem.Allocator, options: Options) !void {
+    var server = Server.init(dispatcher, allocator, options);
     defer server.deinit();
     try server.listenAndServe();
 }
@@ -286,7 +316,7 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
             parsed.header_cache,
         );
 
-        var res = server.app.handle(&req) catch {
+        var res = server.dispatcher.handle(server.dispatcher.ctx, &req) catch {
             sendError(fd, status.HTTP_500_INTERNAL_SERVER_ERROR, "Internal Server Error") catch {};
             return;
         };
@@ -436,9 +466,10 @@ const Connection = struct {
             // need to suppress the body).
             static_dispatch: {
                 if (parsed.content_length != 0) break :static_dispatch;
-                if (self.server.app.middlewares.items.len != 0) break :static_dispatch;
+                if (self.server.dispatcher.has_middleware(self.server.dispatcher.ctx)) break :static_dispatch;
                 if (parsed.is_head) break :static_dispatch;
-                const static_bytes = self.server.app.router.tryStaticDispatch(parsed.method, parsed.path) orelse break :static_dispatch;
+                const try_static = self.server.dispatcher.try_static_dispatch orelse break :static_dispatch;
+                const static_bytes = try_static(self.server.dispatcher.ctx, parsed.method, parsed.path) orelse break :static_dispatch;
                 self.appendStaticBytes(static_bytes) catch return false;
                 self.input.consume(parsed.consumed_len);
                 continue;
@@ -461,7 +492,7 @@ const Connection = struct {
                 parsed.header_cache,
             );
 
-            var res = self.server.app.handle(&req) catch {
+            var res = self.server.dispatcher.handle(self.server.dispatcher.ctx, &req) catch {
                 self.flushWrite() catch {};
                 sendError(self.fd, status.HTTP_500_INTERNAL_SERVER_ERROR, "Internal Server Error") catch {};
                 return false;
@@ -525,7 +556,7 @@ const InputBuffer = struct {
     }
 };
 
-const ParsedRequest = struct {
+pub const ParsedRequest = struct {
     method: []const u8,
     target: []const u8,
     path: []const u8,

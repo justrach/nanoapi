@@ -372,9 +372,10 @@ fn processRequests(conn: *IoConn) Action {
         var dispatched = false;
         static_dispatch: {
             if (parsed.content_length != 0) break :static_dispatch;
-            if (conn.server.app.middlewares.items.len != 0) break :static_dispatch;
+            if (conn.server.dispatcher.has_middleware(conn.server.dispatcher.ctx)) break :static_dispatch;
             if (parsed.is_head) break :static_dispatch;
-            const static_bytes = conn.server.app.router.tryStaticDispatch(parsed.method, parsed.path) orelse break :static_dispatch;
+            const try_static = conn.server.dispatcher.try_static_dispatch orelse break :static_dispatch;
+            const static_bytes = try_static(conn.server.dispatcher.ctx, parsed.method, parsed.path) orelse break :static_dispatch;
             if (!conn.appendStaticBytes(static_bytes)) {
                 // No room in write buffer — flush what we have and come back.
                 return .send_then_recv;
@@ -396,7 +397,7 @@ fn processRequests(conn: *IoConn) Action {
                 parsed.header_cache,
             );
 
-            var res = conn.server.app.handle(&req) catch {
+            var res = conn.server.dispatcher.handle(conn.server.dispatcher.ctx, &req) catch {
                 _ = conn.arena.reset(.retain_capacity);
                 if (conn.write_len > 0) return .send_then_close;
                 return .close;
