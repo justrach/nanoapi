@@ -184,6 +184,20 @@ pub const App = struct {
         return ctx.next();
     }
 
+    /// Build a `server.Dispatcher` vtable wired to this App. Use this when
+    /// driving the runtime via `server.serveGeneric(app.dispatcher(), ...)`
+    /// rather than the `App`-bound `serve()` wrapper. This is also what
+    /// non-`App` consumers (turboAPI, merjs) construct directly with their
+    /// own ctx + adapter functions.
+    pub fn dispatcher(self: *App) @import("server.zig").Dispatcher {
+        return .{
+            .ctx = @ptrCast(self),
+            .handle = appHandleAdapter,
+            .has_middleware = appHasMiddlewareAdapter,
+            .try_static_dispatch = appTryStaticDispatchAdapter,
+        };
+    }
+
     pub fn listenAndServe(self: *App, allocator: std.mem.Allocator, server_options: @import("server.zig").Options) !void {
         try @import("server.zig").serve(self, allocator, server_options);
     }
@@ -207,3 +221,18 @@ pub const App = struct {
         for (self.shutdown_handlers.items) |handler| try handler();
     }
 };
+
+fn appHandleAdapter(ctx: *anyopaque, req: *request.Request) anyerror!response.Response {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    return self.handle(req);
+}
+
+fn appHasMiddlewareAdapter(ctx: *anyopaque) bool {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    return self.middlewares.items.len != 0;
+}
+
+fn appTryStaticDispatchAdapter(ctx: *anyopaque, method: []const u8, path: []const u8) ?[]const u8 {
+    const self: *App = @ptrCast(@alignCast(ctx));
+    return self.router.tryStaticDispatch(method, path);
+}
