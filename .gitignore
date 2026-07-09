@@ -4,8 +4,6 @@ zig-pkg/
 codedb.snapshot
 bench-results/
 .zigrep_archive
-architecture.md
-architecture/
 
 # Generated serverless and infrastructure artifacts
 .aws-sam/
