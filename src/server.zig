@@ -11,6 +11,30 @@ const status = @import("status.zig");
 extern "c" fn socket(domain: c_uint, sock_type: c_uint, protocol: c_uint) c_int;
 extern "c" fn close(fd: c.fd_t) c_int;
 
+/// Set to true by the SIGINT/SIGTERM handlers so the accept loops can drain and
+/// return cleanly instead of running forever. Checked between accepts / event
+/// batches; a blocked `accept`/`kevent`/`io_uring` wait is woken by the signal
+/// filter (kqueue / EINTR) or on the next iteration (io_uring best-effort).
+pub var shutdown_requested = std.atomic.Value(bool).init(false);
+
+fn signalHandler(sig: posix.SIG) callconv(.c) void {
+    _ = sig;
+    shutdown_requested.store(true, .release);
+}
+
+/// Install SIGINT/SIGTERM handlers (idempotent) so the runtime can shut down
+/// gracefully. Safe to call multiple times.
+fn installSignalHandlers() void {
+    if (builtin.os.tag == .windows) return;
+    const act: posix.Sigaction = .{
+        .handler = .{ .handler = &signalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = 0,
+    };
+    posix.sigaction(.INT, &act, null);
+    posix.sigaction(.TERM, &act, null);
+}
+
 pub const Options = struct {
     host: [4]u8 = .{ 127, 0, 0, 1 },
     port: u16 = 8080,
@@ -21,6 +45,10 @@ pub const Options = struct {
     /// of resident memory per connection.
     write_buffer_size: usize = 16 * 1024,
     max_headers: usize = 64,
+    /// Maximum request body size in bytes; larger bodies are rejected with 413.
+    max_body_size: usize = 10 * 1024 * 1024,
+    /// Maximum simultaneous connections in the thread-per-connection runtime.
+    max_connections: usize = 1024,
     runtime: Runtime = .auto,
     /// Number of event-loop / io_uring workers. 0 means one worker per logical CPU.
     worker_threads: usize = 0,
@@ -65,6 +93,10 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     options: Options,
     listen_fd: c.fd_t = -1,
+    /// Live connection counter for the thread-per-connection runtime (bounded by
+    /// `options.max_connections`). Lives on the `Server` so detached threads can
+    /// decrement it without holding a dangling pointer to a stack local.
+    conn_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
     pub fn init(dispatcher: Dispatcher, allocator: std.mem.Allocator, options: Options) Server {
         return .{
@@ -116,16 +148,34 @@ pub const Server = struct {
         self.listen_fd = try createListenSocket(self.options, false);
 
         while (true) {
+            if (shutdown_requested.load(.acquire)) return;
             const fd = c.accept(self.listen_fd, null, null);
             switch (c.errno(fd)) {
                 .SUCCESS => {},
-                .INTR => continue,
+                .INTR => {
+                    if (shutdown_requested.load(.acquire)) return;
+                    continue;
+                },
                 else => |err| return errnoError(err),
             }
             const client_fd: c.fd_t = @intCast(fd);
             configureAcceptedSocket(client_fd);
 
+            // Bound concurrent threads: atomically reserve a slot. When at cap,
+            // decline the connection (close the fd) rather than spawning past the limit.
+            var acquired = false;
+            while (!acquired) {
+                const cur = self.conn_count.load(.acquire);
+                if (cur >= self.options.max_connections) break;
+                if (self.conn_count.cmpxchgWeak(cur, cur + 1, .acq_rel, .monotonic) == null) acquired = true;
+            }
+            if (!acquired) {
+                _ = close(client_fd);
+                continue;
+            }
+
             const thread = std.Thread.spawn(.{}, handleConnection, .{ self, client_fd }) catch {
+                _ = self.conn_count.fetchSub(1, .release);
                 _ = close(client_fd);
                 continue;
             };
@@ -163,9 +213,12 @@ pub const Server = struct {
         defer _ = close(kq);
 
         try registerRead(kq, listen_fd, 0);
+        registerSignal(kq, posix.SIG.INT);
+        registerSignal(kq, posix.SIG.TERM);
 
         var events: [1024]c.Kevent = undefined;
         while (true) {
+            if (shutdown_requested.load(.acquire)) return;
             const n = c.kevent(kq, @as([*]const c.Kevent, @ptrCast(&events)), 0, &events, events.len, null);
             switch (c.errno(n)) {
                 .SUCCESS => {},
@@ -174,6 +227,7 @@ pub const Server = struct {
             }
 
             for (events[0..@intCast(n)]) |ev| {
+                if (ev.filter == c.EVFILT.SIGNAL and shutdown_requested.load(.acquire)) return;
                 if (ev.ident == @as(usize, @intCast(listen_fd))) {
                     const fd = c.accept(listen_fd, null, null);
                     switch (c.errno(fd)) {
@@ -260,13 +314,16 @@ fn effectiveRuntime(requested: Runtime) Runtime {
 }
 
 pub fn serve(app: *app_mod.App, allocator: std.mem.Allocator, options: Options) !void {
-    return serveGeneric(app.dispatcher(), allocator, options);
+    try app.runStartup();
+    defer app.runShutdown() catch {};
+    try serveGeneric(app.dispatcher(), allocator, options);
 }
 
 /// Drive the runtime with any dispatcher — not just `App`. Use this from
 /// non-`App` consumers (turboAPI's Python FFI, merjs' SSR pipeline) by
 /// constructing a `Dispatcher` with your own ctx + adapter functions.
 pub fn serveGeneric(dispatcher: Dispatcher, allocator: std.mem.Allocator, options: Options) !void {
+    installSignalHandlers();
     var server = Server.init(dispatcher, allocator, options);
     defer server.deinit();
     try server.listenAndServe();
@@ -274,6 +331,7 @@ pub fn serveGeneric(dispatcher: Dispatcher, allocator: std.mem.Allocator, option
 
 fn handleConnection(server: *Server, fd: c.fd_t) void {
     defer _ = close(fd);
+    defer server.conn_count.fetchSub(1, .release);
 
     var input = InputBuffer{
         .buf = server.allocator.alloc(u8, server.options.read_buffer_size) catch return,
@@ -300,9 +358,15 @@ fn handleConnection(server: *Server, fd: c.fd_t) void {
                 return;
             },
         };
-        const body = readFullBody(req_allocator, fd, parsed) catch {
-            sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
-            return;
+        const body = readFullBody(req_allocator, fd, parsed, server.options.max_body_size) catch |err| switch (err) {
+            error.BodyTooLarge => {
+                sendError(fd, status.HTTP_413_PAYLOAD_TOO_LARGE, "Payload Too Large") catch {};
+                return;
+            },
+            else => {
+                sendError(fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+                return;
+            },
         };
 
         var req = request.Request.initPartsCached(
@@ -475,10 +539,17 @@ const Connection = struct {
                 continue;
             }
 
-            const body = readFullBody(req_allocator, self.fd, parsed) catch {
-                self.flushWrite() catch {};
-                sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
-                return false;
+            const body = readFullBody(req_allocator, self.fd, parsed, self.server.options.max_body_size) catch |err| switch (err) {
+                error.BodyTooLarge => {
+                    self.flushWrite() catch {};
+                    sendError(self.fd, status.HTTP_413_PAYLOAD_TOO_LARGE, "Payload Too Large") catch {};
+                    return false;
+                },
+                else => {
+                    self.flushWrite() catch {};
+                    sendError(self.fd, status.HTTP_400_BAD_REQUEST, "Bad Request") catch {};
+                    return false;
+                },
             };
 
             var req = request.Request.initPartsCached(
@@ -696,7 +767,9 @@ fn readFullBody(
     allocator: std.mem.Allocator,
     fd: c.fd_t,
     parsed: ParsedRequest,
+    max_body_size: usize,
 ) !BodyBuffer {
+    if (parsed.content_length > max_body_size) return error.BodyTooLarge;
     if (parsed.content_length == 0) return .{ .bytes = "" };
     if (parsed.body.len >= parsed.content_length) {
         return .{ .bytes = parsed.body[0..parsed.content_length] };
@@ -789,6 +862,23 @@ fn registerRead(kq: c.fd_t, fd: c.fd_t, udata: usize) !void {
         .SUCCESS => {},
         else => |err| return errnoError(err),
     }
+}
+
+/// Best-effort kqueue signal filter registration so the event loop wakes on
+/// SIGINT/SIGTERM. Errors are ignored: the loop top also polls
+/// `shutdown_requested` between batches, and a blocked `kevent` is interrupted
+/// (EINTR) by the sigaction handler regardless.
+fn registerSignal(kq: c.fd_t, sig: posix.SIG) void {
+    var change = [_]c.Kevent{.{
+        .ident = @intCast(@intFromEnum(sig)),
+        .filter = @intCast(c.EVFILT.SIGNAL),
+        .flags = c.EV.ADD | c.EV.ENABLE,
+        .fflags = 0,
+        .data = 0,
+        .udata = 0,
+    }};
+    var ignored: [1]c.Kevent = undefined;
+    _ = c.kevent(kq, &change, change.len, &ignored, 0, null);
 }
 
 fn configureAcceptedSocket(fd: c.fd_t) void {
@@ -1117,7 +1207,7 @@ fn sendFileBodyZeroCopy(socket_fd: c.fd_t, file_fd: c.fd_t, file_size: u64) !voi
                 }
             }
         },
-        else => unreachable,
+        else => return error.Unexpected,
     }
 }
 
@@ -1152,11 +1242,26 @@ fn chunkedFlush(sink: *anyopaque) !void {
 
 fn sendError(fd: c.fd_t, code: u16, message: []const u8) !void {
     var line_buf: [512]u8 = undefined;
-    const response_bytes = try std.fmt.bufPrint(
+    // Clamp the message so bufPrint can never overflow the 512-byte buffer.
+    // `overhead` is a conservative upper bound on every byte the formatted
+    // response needs *except* the variable {s} message: the literal template
+    // text plus generous bounds for the status code (3 digits), the reason
+    // phrase (64 chars), and the Content-Length integer (20 digits).
+    const overhead =
+        "HTTP/1.1 ".len +
+        3 +
+        1 +
+        64 +
+        "\r\nContent-Length: ".len +
+        20 +
+        "\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n".len;
+    const max_msg = line_buf.len - overhead;
+    const clamped = if (message.len <= max_msg) message else message[0..max_msg];
+    const response_bytes = std.fmt.bufPrint(
         &line_buf,
         "HTTP/1.1 {d} {s}\r\nContent-Length: {d}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{s}",
-        .{ code, status.text(code), message.len, message },
-    );
+        .{ code, status.text(code), clamped.len, clamped },
+    ) catch return;
     try sendAll(fd, response_bytes);
 }
 
@@ -1283,4 +1388,29 @@ test "parse HTTP request consumes zero-body request before pipeline" {
     try std.testing.expectEqual(@as(usize, 0), parsed.content_length);
     try std.testing.expectEqual(@as(usize, 0), parsed.body.len);
     try std.testing.expectEqualStrings("GET /next HTTP/1.1\r\n\r\n", bytes[parsed.consumed_len..]);
+}
+
+test "readFullBody rejects oversized content length" {
+    const allocator = std.testing.allocator;
+    const parsed: ParsedRequest = .{
+        .method = "POST",
+        .target = "/upload",
+        .path = "/upload",
+        .query_string = "",
+        .headers = &.{},
+        .header_cache = .{},
+        .body = "",
+        .body_start = 0,
+        .consumed_len = 0,
+        .content_length = 11,
+        .keep_alive = true,
+        .send_keep_alive_header = false,
+        .is_head = false,
+    };
+    // content_length (11) exceeds max_body_size (10); the guard returns before
+    // any allocation or recv, so the dummy fd (-1) is never touched.
+    try std.testing.expectError(
+        error.BodyTooLarge,
+        readFullBody(allocator, @as(c.fd_t, -1), parsed, 10),
+    );
 }

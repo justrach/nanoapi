@@ -191,6 +191,8 @@ pub fn run(server: *Server, listen_fd: linux.fd_t) !void {
 
     var cqes: [256]linux.io_uring_cqe = undefined;
     while (true) {
+        // best-effort: checked between io_uring waits
+        if (server_mod.shutdown_requested.load(.acquire)) return;
         _ = try ring.submit_and_wait(1);
         const n = try ring.copy_cqes(&cqes, 0);
         for (cqes[0..n]) |cqe| {
@@ -203,6 +205,8 @@ fn runWithSingleshotAccept(server: *Server, listen_fd: linux.fd_t, ring: *linux.
     _ = try ring.accept(ACCEPT_TAG, listen_fd, null, null, 0);
     var cqes: [256]linux.io_uring_cqe = undefined;
     while (true) {
+        // best-effort: checked between io_uring waits
+        if (server_mod.shutdown_requested.load(.acquire)) return;
         _ = try ring.submit_and_wait(1);
         const n = try ring.copy_cqes(&cqes, 0);
         for (cqes[0..n]) |cqe| {
