@@ -275,6 +275,39 @@ pub const APIRouter = struct {
         return self.routes_list.items;
     }
 
+    /// Exact-route bookkeeping that runs after a route has been appended to
+    /// `routes_list` and registered with `core_router`. For a root GET it records
+    /// `root_get_index`; for a non-root exact path it inserts into `exact_routes`,
+    /// `exact_route_map`, and updates the method mask / min/max path-length arrays.
+    /// The caller MUST have reserved capacity in `exact_routes` /
+    /// `exact_route_map` (via `ensureUnusedCapacity`) before appending the route
+    /// when the path is a non-root exact path; this method uses the
+    /// `...AssumeCapacity` variants accordingly.
+    fn registerExactRoute(self: *APIRouter, owned_method: []const u8, full_path: []const u8, index: usize) void {
+        const is_root_get = std.mem.eql(u8, owned_method, "GET") and std.mem.eql(u8, full_path, "/");
+        if (is_root_get) {
+            self.root_get_index = index;
+            return;
+        }
+        if (!isExactPath(full_path)) return;
+
+        const exact_method_slot = methodSlot(owned_method);
+        const exact_key = ExactRouteKey{ .method = owned_method, .path = full_path };
+        self.exact_routes.appendAssumeCapacity(.{
+            .method = owned_method,
+            .method_slot = exact_method_slot,
+            .path = full_path,
+            .index = index,
+        });
+        const gop = self.exact_route_map.getOrPutAssumeCapacityContext(exact_key, .{});
+        if (!gop.found_existing) {
+            gop.value_ptr.* = index;
+        }
+        self.exact_method_mask |= methodSlotMaskBit(exact_method_slot);
+        self.exact_min_path_len[exact_method_slot] = @min(self.exact_min_path_len[exact_method_slot], full_path.len);
+        self.exact_max_path_len[exact_method_slot] = @max(self.exact_max_path_len[exact_method_slot], full_path.len);
+    }
+
     fn routeWithInheritedTags(
         self: *APIRouter,
         method: []const u8,
@@ -318,25 +351,7 @@ pub const APIRouter = struct {
 
         try self.core_router.addRoute(method, full_path, key);
 
-        if (is_root_get) {
-            self.root_get_index = index;
-        } else if (is_exact_non_root) {
-            const exact_method_slot = methodSlot(owned_method);
-            const exact_key = ExactRouteKey{ .method = owned_method, .path = full_path };
-            self.exact_routes.appendAssumeCapacity(.{
-                .method = owned_method,
-                .method_slot = exact_method_slot,
-                .path = full_path,
-                .index = index,
-            });
-            const gop = self.exact_route_map.getOrPutAssumeCapacityContext(exact_key, .{});
-            if (!gop.found_existing) {
-                gop.value_ptr.* = index;
-            }
-            self.exact_method_mask |= methodSlotMaskBit(exact_method_slot);
-            self.exact_min_path_len[exact_method_slot] = @min(self.exact_min_path_len[exact_method_slot], full_path.len);
-            self.exact_max_path_len[exact_method_slot] = @max(self.exact_max_path_len[exact_method_slot], full_path.len);
-        }
+        self.registerExactRoute(owned_method, full_path, index);
     }
 
     fn routeWithInheritedTagsStatic(
@@ -383,25 +398,7 @@ pub const APIRouter = struct {
 
         try self.core_router.addRoute(method, full_path, key);
 
-        if (is_root_get) {
-            self.root_get_index = index;
-        } else if (is_exact_non_root) {
-            const exact_method_slot = methodSlot(owned_method);
-            const exact_key = ExactRouteKey{ .method = owned_method, .path = full_path };
-            self.exact_routes.appendAssumeCapacity(.{
-                .method = owned_method,
-                .method_slot = exact_method_slot,
-                .path = full_path,
-                .index = index,
-            });
-            const gop = self.exact_route_map.getOrPutAssumeCapacityContext(exact_key, .{});
-            if (!gop.found_existing) {
-                gop.value_ptr.* = index;
-            }
-            self.exact_method_mask |= methodSlotMaskBit(exact_method_slot);
-            self.exact_min_path_len[exact_method_slot] = @min(self.exact_min_path_len[exact_method_slot], full_path.len);
-            self.exact_max_path_len[exact_method_slot] = @max(self.exact_max_path_len[exact_method_slot], full_path.len);
-        }
+        self.registerExactRoute(owned_method, full_path, index);
     }
 };
 
