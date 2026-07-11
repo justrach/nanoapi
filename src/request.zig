@@ -385,12 +385,18 @@ fn parseMultipart(allocator: std.mem.Allocator, body: []const u8, boundary: []co
 
     var pos: usize = 0;
     while (true) {
-        if (!std.mem.startsWith(u8, body[pos..], marker)) return error.InvalidMultipartBody;
+        // Check offsets before slicing so malformed or truncated multipart bodies
+        // return a client error instead of trapping on an out-of-bounds slice.
+        if (pos > body.len or !std.mem.startsWith(u8, body[pos..], marker)) {
+            return error.InvalidMultipartBody;
+        }
         pos += marker.len;
+        if (pos > body.len) return error.InvalidMultipartBody;
 
         if (std.mem.startsWith(u8, body[pos..], "--")) break;
         if (!std.mem.startsWith(u8, body[pos..], "\r\n")) return error.InvalidMultipartBody;
         pos += 2;
+        if (pos > body.len) return error.InvalidMultipartBody;
 
         const header_end = std.mem.indexOfPos(u8, body, pos, "\r\n\r\n") orelse return error.InvalidMultipartBody;
         const headers = body[pos..header_end];
@@ -451,6 +457,15 @@ fn unquote(value: []const u8) []const u8 {
         return value[1 .. value.len - 1];
     }
     return value;
+}
+
+test "Request rejects truncated multipart bodies without trapping" {
+    const allocator = std.testing.allocator;
+    const headers = [_]HeaderPair{
+        .{ .name = "content-type", .value = "multipart/form-data; boundary=x" },
+    };
+    var req = Request.init(allocator, "POST", "/upload", &headers, "--x\r\n");
+    try std.testing.expectError(error.InvalidMultipartBody, req.formData());
 }
 
 test "Request caches common headers from initParts" {
