@@ -41,6 +41,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    const bench_iterations = b.option(u64, "bench-iterations", "Dispatch benchmark iterations");
+    const bench_warmup = b.option(u64, "bench-warmup", "Dispatch benchmark warmup iterations");
+    const bench_repeat = b.option(u32, "bench-repeat", "Dispatch benchmark repetitions");
+    const bench_json = b.option(bool, "bench-json", "Emit dispatch benchmark results as JSON") orelse false;
+
     const bench = b.addExecutable(.{
         .name = "dispatch_bench",
         .root_module = b.createModule(.{
@@ -52,8 +57,16 @@ pub fn build(b: *std.Build) void {
     bench.root_module.addImport("nanoapi", mod);
 
     const run_bench = b.addRunArtifact(bench);
-    if (b.args) |args| run_bench.addArgs(args);
-
+    if (bench_iterations) |iterations| run_bench.addArg(b.fmt("{d}", .{iterations}));
+    if (bench_warmup) |warmup| {
+        run_bench.addArg("--warmup");
+        run_bench.addArg(b.fmt("{d}", .{warmup}));
+    }
+    if (bench_repeat) |repeat| {
+        run_bench.addArg("--repeat");
+        run_bench.addArg(b.fmt("{d}", .{repeat}));
+    }
+    if (bench_json) run_bench.addArg("--format=json");
     const bench_step = b.step("bench", "Run dispatch benchmark");
     bench_step.dependOn(&run_bench.step);
 
@@ -69,8 +82,6 @@ pub fn build(b: *std.Build) void {
     http_server.root_module.addImport("nanoapi", mod);
 
     const run_http_server = b.addRunArtifact(http_server);
-    if (b.args) |args| run_http_server.addArgs(args);
-
     const http_server_step = b.step("http-server", "Run benchmark HTTP server");
     http_server_step.dependOn(&run_http_server.step);
 }

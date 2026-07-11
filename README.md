@@ -5,17 +5,28 @@ typed route parameters, response helpers, OpenAPI metadata, streaming responses,
 middleware, upload helpers, and a small multi-worker native HTTP/1.1 server.
 
 The hot routing path is backed by `turboapi-core`, while validation primitives
-come from `dhi`. The current dependency pin uses the `dhi` performance branch
-from `justrach/dhi#54`; switch it back to `dhi` main once that PR lands.
+come from `dhi`. The Zig 0.17-compatible snapshots are vendored under `vendor/`
+until upstream releases with the new reflection API are available; they retain
+the upstream project licenses and APIs.
 
 ## Install
 
-For local development, clone the repo and run the standard Zig build steps:
+For local development, use the Zig 0.17 development compiler (the CI workflow
+tracks `master`) and run the standard build steps:
 
 ```bash
 git clone https://github.com/justrach/nanoapi.git
 cd nanoapi
+zig version                 # should report 0.17.0-dev or newer
+zig fmt --check build.zig src bench
+zig build
 zig build test
+```
+
+For production-style performance measurements, use the optimized profile:
+
+```bash
+zig build -Doptimize=ReleaseFast
 ```
 
 To consume NanoAPI from another Zig package, add it as a dependency and import
@@ -230,7 +241,7 @@ NanoAPI is currently optimized around a small number of hot paths:
 
 ### macOS event_loop (kqueue)
 
-Environment: macOS arm64, Zig 0.16.0, `wrk 4.2.0`, `-t4 -c64 -d3s`.
+Environment: macOS arm64, Zig 0.17.0-dev (master), `wrk 4.2.0`, `-t4 -c64 -d3s`.
 NanoAPI used `event_loop` with `worker_threads=0` (auto). The Rust comparison
 servers used 4 workers.
 
@@ -362,8 +373,8 @@ References:
 
 ```bash
 zig build test
-zig build -Doptimize=ReleaseFast bench -- 10000000
-zig build -Doptimize=ReleaseFast bench -- 1000000 --warmup 100000 --repeat 5 --format=json
+zig build -Doptimize=ReleaseFast bench -Dbench-iterations=10000000
+zig build -Doptimize=ReleaseFast bench -Dbench-iterations=1000000 -Dbench-warmup=100000 -Dbench-repeat=5 -Dbench-json=true
 zig build -Doptimize=ReleaseFast http-server -- 8080
 zig build -Doptimize=ReleaseFast http-server -- 8080 event_loop
 zig build -Doptimize=ReleaseFast http-server -- 8080 event_loop 4
@@ -381,7 +392,14 @@ wrk -t4 -c64 -d10s --latency 'http://127.0.0.1:8080/users/42?verbose=true'
 ./scripts/bench-http.sh
 WORKERS=4 ./scripts/bench-http.sh
 ./scripts/check-dispatch-bench.sh
+
+# Compare the pre-0.17 HEAD with the current Zig 0.17 tree (5 runs)
+./scripts/bench-zig-compare.sh
 ```
+
+`bench-zig-compare.sh` reports raw repeated results for the baseline and current
+working tree. It is a migration A/B comparison, not a compiler-only comparison,
+because the 0.17 reflection and dependency updates are part of the current tree.
 
 For the Linux io_uring suite that produced the cross-framework numbers
 above (cross-compiles a static `aarch64-linux-musl` binary, runs it inside
