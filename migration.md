@@ -52,6 +52,7 @@ are released:
 
 - dhi: https://github.com/justrach/dhi/issues/69
 - turboapi-core: https://github.com/justrach/turboapi-core/issues/3
+- NanoAPI tracking issue: https://github.com/justrach/nanoapi/issues/23
 
 The desired long-term follow-up is to replace the path dependencies in
 `build.zig.zon` with released upstream revisions.
