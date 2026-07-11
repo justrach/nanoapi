@@ -1,15 +1,13 @@
 .{
     .name = .nanoapi,
     .version = "0.0.1",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev",
     .dependencies = .{
         .turboapi_core = .{
-            .url = "git+https://github.com/justrach/turboapi-core.git?ref=main#f92f3cc48b8d3767fbfe2d92e49e14f52f532f60",
-            .hash = "turboapi_core-0.1.0-DjdHgmaTAAC5tl8N6M66vDdnSSS6CPbk6QwhlCLH--PZ",
+            .path = "vendor/turboapi-core",
         },
         .dhi = .{
-            .url = "git+https://github.com/justrach/dhi.git?ref=codex/dhi-fast-validators#ba44a5d04ff0c67dd4d9975963e162c77b13f496",
-            .hash = "dhi-0.1.0-Fz3bn4aKAwDis5C7d-B58ZIR5zy9P38M1einoxEm5IgU",
+            .path = "vendor/dhi",
         },
     },
     .paths = .{""},

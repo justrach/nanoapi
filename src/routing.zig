@@ -81,8 +81,8 @@ pub const APIRouter = struct {
     exact_routes: std.ArrayList(ExactRoute) = .empty,
     exact_route_map: ExactRouteMap = .empty,
     exact_method_mask: u8 = 0,
-    exact_min_path_len: [8]usize = [_]usize{std.math.maxInt(usize)} ** 8,
-    exact_max_path_len: [8]usize = [_]usize{0} ** 8,
+    exact_min_path_len: [8]usize = @splat(std.math.maxInt(usize)),
+    exact_max_path_len: [8]usize = @splat(0),
     root_get_index: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, router_options: RouterOptions) !APIRouter {

@@ -136,20 +136,31 @@ pub fn postWithBody(
 
 pub fn parsePath(comptime T: type, req: *const request.Request) ParseError!T {
     assertStruct(T);
-    const fields = @typeInfo(T).@"struct".fields;
-    if (comptime fields.len <= 1) return parseStruct(T, req, .path);
+    const field_names = @typeInfo(T).@"struct".field_names;
+    if (comptime field_names.len <= 1) return parseStruct(T, req, .path);
     return parsePathStruct(T, req);
 }
 
 pub fn parseQuery(comptime T: type, req: *const request.Request) ParseError!T {
     assertStruct(T);
-    const fields = @typeInfo(T).@"struct".fields;
-    if (comptime fields.len <= 1) return parseStruct(T, req, .query);
+    const field_names = @typeInfo(T).@"struct".field_names;
+    if (comptime field_names.len <= 1) return parseStruct(T, req, .query);
     return parseQueryStruct(T, req);
 }
 
 pub fn parseBody(comptime T: type, req: *const request.Request) ParseError!T {
     assertStruct(T);
+
+    // Most body models do not use DHI's naming-based validators. Use Zig's
+    // direct typed JSON decoder for those models: it avoids constructing a
+    // generic JSON value tree and an additional validation pass.
+    if (comptime !needsDhiValidation(T)) {
+        return std.json.parseFromSliceLeaky(T, req.allocator, req.body, .{}) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ValidationFailed,
+        };
+    }
+
     return dhi.parseAndValidate(T, req.body, req.allocator) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.ValidationFailed,
@@ -164,9 +175,9 @@ pub fn allocParameters(
     assertStruct(PathParams);
     assertStruct(QueryParams);
 
-    const path_fields = @typeInfo(PathParams).@"struct".fields;
-    const query_fields = @typeInfo(QueryParams).@"struct".fields;
-    const total = path_fields.len + query_fields.len;
+    const path_info = @typeInfo(PathParams).@"struct";
+    const query_info = @typeInfo(QueryParams).@"struct";
+    const total = path_info.field_names.len + query_info.field_names.len;
 
     const out = try allocator.alloc(meta.Parameter, total);
     errdefer allocator.free(out);
@@ -174,12 +185,12 @@ pub fn allocParameters(
     var initialized: usize = 0;
     errdefer freeParameters(allocator, out[0..initialized]);
 
-    inline for (path_fields) |field| {
-        out[initialized] = try makeParameter(allocator, field, .path);
+    inline for (path_info.field_names, path_info.field_types, path_info.field_attrs) |name, field_type, attrs| {
+        out[initialized] = try makeParameter(allocator, name, field_type, attrs, .path);
         initialized += 1;
     }
-    inline for (query_fields) |field| {
-        out[initialized] = try makeParameter(allocator, field, .query);
+    inline for (query_info.field_names, query_info.field_types, query_info.field_attrs) |name, field_type, attrs| {
+        out[initialized] = try makeParameter(allocator, name, field_type, attrs, .query);
         initialized += 1;
     }
 
@@ -197,14 +208,15 @@ fn parseStruct(comptime T: type, req: *const request.Request, comptime location:
     assertStruct(T);
     var result: T = undefined;
 
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        switch (try parseField(field.type, req, field.name, location)) {
-            .value => |value| @field(result, field.name) = value,
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, field_type, attrs| {
+        switch (try parseField(field_type, req, name, location)) {
+            .value => |value| @field(result, name) = value,
             .missing => {
-                if (field.defaultValue()) |default| {
-                    @field(result, field.name) = default;
-                } else if (comptime isOptional(field.type)) {
-                    @field(result, field.name) = null;
+                if (fieldDefault(field_type, attrs)) |default| {
+                    @field(result, name) = default;
+                } else if (comptime isOptional(field_type)) {
+                    @field(result, name) = null;
                 } else {
                     return missingRequiredError(location);
                 }
@@ -221,17 +233,17 @@ fn parseStruct(comptime T: type, req: *const request.Request, comptime location:
 fn parseQueryStruct(comptime T: type, req: *const request.Request) ParseError!T {
     assertStruct(T);
 
-    const fields = @typeInfo(T).@"struct".fields;
-    if (comptime fields.len == 0) return .{};
+    const info = @typeInfo(T).@"struct";
+    if (comptime info.field_names.len == 0) return .{};
 
     var result: T = undefined;
-    var seen = [_]bool{false} ** fields.len;
+    var seen: [info.field_names.len]bool = @splat(false);
 
-    inline for (fields, 0..) |field, i| {
-        if (field.defaultValue()) |default| {
-            @field(result, field.name) = default;
-        } else if (comptime isOptional(field.type)) {
-            @field(result, field.name) = null;
+    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, field_type, attrs, i| {
+        if (fieldDefault(field_type, attrs)) |default| {
+            @field(result, name) = default;
+        } else if (comptime isOptional(field_type)) {
+            @field(result, name) = null;
         } else {
             seen[i] = false;
         }
@@ -249,17 +261,17 @@ fn parseQueryStruct(comptime T: type, req: *const request.Request) ParseError!T 
         const value = pair[eq + 1 ..];
 
         var matched = false;
-        inline for (fields, 0..) |field, i| {
-            if (!matched and !seen[i] and std.mem.eql(u8, key, field.name)) {
-                @field(result, field.name) = try parseValue(field.type, value);
+        inline for (info.field_names, info.field_types, 0..) |name, field_type, i| {
+            if (!matched and !seen[i] and std.mem.eql(u8, key, name)) {
+                @field(result, name) = try parseValue(field_type, value);
                 seen[i] = true;
                 matched = true;
             }
         }
     }
 
-    inline for (fields, 0..) |field, i| {
-        if (!seen[i] and field.default_value_ptr == null and !isOptional(field.type)) {
+    inline for (info.field_types, info.field_attrs, 0..) |field_type, attrs, i| {
+        if (!seen[i] and attrs.default_value_ptr == null and !isOptional(field_type)) {
             return error.MissingRequiredQueryParam;
         }
     }
@@ -273,17 +285,17 @@ fn parseQueryStruct(comptime T: type, req: *const request.Request) ParseError!T 
 fn parsePathStruct(comptime T: type, req: *const request.Request) ParseError!T {
     assertStruct(T);
 
-    const fields = @typeInfo(T).@"struct".fields;
-    if (comptime fields.len == 0) return .{};
+    const info = @typeInfo(T).@"struct";
+    if (comptime info.field_names.len == 0) return .{};
 
     var result: T = undefined;
-    var seen = [_]bool{false} ** fields.len;
+    var seen: [info.field_names.len]bool = @splat(false);
 
-    inline for (fields, 0..) |field, i| {
-        if (field.defaultValue()) |default| {
-            @field(result, field.name) = default;
-        } else if (comptime isOptional(field.type)) {
-            @field(result, field.name) = null;
+    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, field_type, attrs, i| {
+        if (fieldDefault(field_type, attrs)) |default| {
+            @field(result, name) = default;
+        } else if (comptime isOptional(field_type)) {
+            @field(result, name) = null;
         } else {
             seen[i] = false;
         }
@@ -292,17 +304,17 @@ fn parsePathStruct(comptime T: type, req: *const request.Request) ParseError!T {
     const params = req.path_params orelse return error.MissingRequiredPathParam;
     for (params.entries()) |param| {
         var matched = false;
-        inline for (fields, 0..) |field, i| {
-            if (!matched and !seen[i] and std.mem.eql(u8, param.key, field.name)) {
-                @field(result, field.name) = try parsePathParamValue(field.type, param);
+        inline for (info.field_names, info.field_types, 0..) |name, field_type, i| {
+            if (!matched and !seen[i] and std.mem.eql(u8, param.key, name)) {
+                @field(result, name) = try parsePathParamValue(field_type, param);
                 seen[i] = true;
                 matched = true;
             }
         }
     }
 
-    inline for (fields, 0..) |field, i| {
-        if (!seen[i] and field.default_value_ptr == null and !isOptional(field.type)) {
+    inline for (info.field_types, info.field_attrs, 0..) |field_type, attrs, i| {
+        if (!seen[i] and attrs.default_value_ptr == null and !isOptional(field_type)) {
             return error.MissingRequiredPathParam;
         }
     }
@@ -447,16 +459,24 @@ fn parseBool(raw: []const u8) ParseError!bool {
     return error.InvalidBool;
 }
 
+fn fieldDefault(comptime T: type, attrs: std.builtin.Type.Struct.FieldAttributes) ?T {
+    const ptr = attrs.default_value_ptr orelse return null;
+    const value_ptr: *const T = @ptrCast(@alignCast(ptr));
+    return value_ptr.*;
+}
+
 fn makeParameter(
     allocator: std.mem.Allocator,
-    comptime field: std.builtin.Type.StructField,
+    name: []const u8,
+    comptime field_type: type,
+    attrs: std.builtin.Type.Struct.FieldAttributes,
     comptime location: meta.Location,
 ) !meta.Parameter {
     return .{
-        .name = try allocator.dupe(u8, field.name),
+        .name = try allocator.dupe(u8, name),
         .location = location,
-        .schema_type = schemaType(field.type),
-        .required = location == .path or (field.default_value_ptr == null and !isOptional(field.type)),
+        .schema_type = schemaType(field_type),
+        .required = location == .path or (attrs.default_value_ptr == null and !isOptional(field_type)),
     };
 }
 
@@ -476,9 +496,9 @@ fn isOptional(comptime T: type) bool {
 }
 
 fn needsDhiValidation(comptime T: type) bool {
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (std.mem.endsWith(u8, field.name, "_ne")) return true;
-        if (std.mem.eql(u8, field.name, "email") or std.mem.endsWith(u8, field.name, "_email")) return true;
+    inline for (@typeInfo(T).@"struct".field_names) |name| {
+        if (std.mem.endsWith(u8, name, "_ne")) return true;
+        if (std.mem.eql(u8, name, "email") or std.mem.endsWith(u8, name, "_email")) return true;
     }
     return false;
 }
